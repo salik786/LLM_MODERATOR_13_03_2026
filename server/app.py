@@ -128,7 +128,8 @@ load_dotenv()
 
 # Get frontend URL first (needed for CORS)
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").strip()
-
+if FRONTEND_URL.endswith('/'):
+    FRONTEND_URL = FRONTEND_URL[:-1]
 allowed_origins = [
     "http://localhost:3000",
     "http://localhost:3001",
@@ -148,8 +149,8 @@ socketio = SocketIO(
     async_mode="threading",
     logger=True,
     engineio_logger=True,
-    transports=['polling'],
-    allow_upgrades=False,
+    transports=['polling','websocket'],
+    allow_upgrades=True,
     ping_timeout=60,
     ping_interval=25,
     max_http_buffer_size=1e8
