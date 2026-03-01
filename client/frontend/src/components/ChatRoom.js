@@ -1,5 +1,5 @@
 // ============================================================
-// ChatRoom.js - PURE TEXT, NO VOICE, NO CLUTTER
+// ChatRoom.js - RESEARCH VERSION (Desert Survival Task)
 // ============================================================
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
@@ -10,7 +10,10 @@ import {
   MdContentCopy,
   MdCheck,
   MdPerson,
-  MdChat
+  MdChat,
+  MdDragHandle,
+  MdCheckCircle,
+  MdWarning
 } from "react-icons/md";
 
 // ============================================================
@@ -38,7 +41,25 @@ const getUserColor = (userName, currentUserName) => {
 };
 
 // ============================================================
-// 🎯 MAIN CHATROOM COMPONENT - PURE TEXT, NO VOICE
+// 🏜️ DESERT SURVIVAL ITEMS (for ranking)
+// ============================================================
+const DESERT_ITEMS = [
+  "A flashlight (4 battery size)",
+  "A map of the region",
+  "A compass",
+  "A large plastic sheet",
+  "A box of matches",
+  "A winter coat",
+  "A bottle of salt tablets (1000 tablets)",
+  "A small knife",
+  "2 quarts of water per person",
+  "A cosmetic mirror",
+  "A parachute (red & white)",
+  "A book - 'Edible Animals of the Desert'"
+];
+
+// ============================================================
+// 🎯 MAIN CHATROOM COMPONENT
 // ============================================================
 export default function ChatRoom() {
   const { roomId } = useParams();
@@ -58,11 +79,20 @@ export default function ChatRoom() {
   const [showParticipants, setShowParticipants] = useState(false);
   const [participants, setParticipants] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState("connecting");
+  
+  // ============================================================
+  // 📊 RESEARCH STUDY STATE
+  // ============================================================
+  const [showRankingModal, setShowRankingModal] = useState(false);
+  const [ranking, setRanking] = useState([]);
+  const [rankingSubmitted, setRankingSubmitted] = useState(false);
+  const [timeWarning, setTimeWarning] = useState(false);
+  const [draggedItem, setDraggedItem] = useState(null);
 
   const messagesEndRef = useRef(null);
 
   // ============================================================
-  // 🔊 LOCAL SEND SOUND (keep for feedback)
+  // 🔊 LOCAL SEND SOUND
   // ============================================================
   const [sendSound] = useState(() => {
     const audio = new Audio();
@@ -86,98 +116,133 @@ export default function ChatRoom() {
   // ============================================================
   // ⚡ SOCKET CONNECTION & MESSAGES
   // ============================================================
- // ============================================================
-// ⚡ SOCKET CONNECTION & MESSAGES - FIXED VERSION
-// ============================================================
-useEffect(() => {
-  if (!roomId || !userName) return;
+  useEffect(() => {
+    if (!roomId || !userName) return;
 
-  setConnectionStatus("connecting");
+    setConnectionStatus("connecting");
 
-  // Connection events
-  socket.on("connect", () => {
-    setConnectionStatus("connected");
-    socket.emit("join_room", { room_id: roomId, user_name: userName });
-  });
+    // Connection events
+    socket.on("connect", () => {
+      setConnectionStatus("connected");
+      socket.emit("join_room", { room_id: roomId, user_name: userName });
+    });
 
-  socket.on("disconnect", () => {
-    setConnectionStatus("disconnected");
-  });
+    socket.on("disconnect", () => {
+      setConnectionStatus("disconnected");
+    });
 
-  socket.on("connect_error", () => {
-    setConnectionStatus("error");
-  });
+    socket.on("connect_error", () => {
+      setConnectionStatus("error");
+    });
 
-  // Room events
-  socket.on("joined_room", () => {
-    setReady(true);
-    setConnectionStatus("connected");
-    setParticipants(prev => {
-      if (!prev.includes(userName)) {
-        return [...prev, userName];
+    // Room events
+    socket.on("joined_room", () => {
+      setReady(true);
+      setConnectionStatus("connected");
+      setParticipants(prev => {
+        if (!prev.includes(userName)) {
+          return [...prev, userName];
+        }
+        return prev;
+      });
+    });
+
+    socket.on("chat_history", (data) => {
+      setMessages(data.chat_history || []);
+      if (data.participants) {
+        setParticipants(data.participants);
+      } else {
+        setParticipants([userName]);
       }
-      return prev;
     });
-  });
 
-  socket.on("chat_history", (data) => {
-    setMessages(data.chat_history || []);
-    if (data.participants) {
-      setParticipants(data.participants);
+    socket.on("receive_message", (data) => {
+      console.log("📨 RECEIVED MESSAGE:", data);
+      
+      setMessages((prev) => {
+        // Check for duplicates
+        const isDuplicate = prev.some(
+          (msg) => 
+            msg.sender === data.sender && 
+            msg.message === data.message &&
+            Math.abs(new Date(msg.timestamp || 0) - new Date(data.timestamp || 0)) < 1000
+        );
+        
+        if (isDuplicate) {
+          console.log("⚠️ Duplicate message ignored");
+          return prev;
+        }
+        
+        const newMessage = {
+          ...data,
+          timestamp: data.timestamp || new Date().toISOString()
+        };
+        
+        return [...prev, newMessage];
+      });
+    });
+
+    socket.on("participants_update", (data) => {
+      setParticipants(data.participants || []);
+    });
+
+    // ============================================================
+    // 📊 RESEARCH STUDY SOCKET EVENTS
+    // ============================================================
+    socket.on("time_warning", () => {
+      setTimeWarning(true);
+      setShowRankingModal(true);
+    });
+
+    socket.on("ranking_submitted", (data) => {
+      if (data.success) {
+        setRankingSubmitted(true);
+        setShowRankingModal(false);
+        // Show success message in chat
+        const successMsg = {
+          sender: "System",
+          message: "✅ Final ranking submitted successfully!",
+          timestamp: new Date().toISOString()
+        };
+        setMessages(prev => [...prev, successMsg]);
+      } else {
+        alert("❌ Failed to submit ranking: " + data.message);
+      }
+    });
+
+    // Session ended handler
+    socket.on("session_ended", (data) => {
+      console.log("📨 Session ended with data:", data);
+      const feedback = data?.feedback || "Session ended. Thank you for participating!";
+      navigate("/feedback", { 
+        state: { 
+          feedback: feedback,
+          room_id: data?.room_id 
+        } 
+      });
+      setIsLoadingFeedback(false);
+    });
+
+    // If already connected, join room immediately
+    if (socket.connected) {
+      socket.emit("join_room", { room_id: roomId, user_name: userName });
     } else {
-      setParticipants([userName]);
+      socket.connect();
     }
-  });
 
-  socket.on("receive_message", (data) => {
-    setMessages((prev) => {
-      const isDuplicate = prev.length > 0 &&
-        prev[prev.length - 1].sender === data.sender &&
-        prev[prev.length - 1].message === data.message;
-      return isDuplicate ? prev : [...prev, data];
-    });
-  });
-
-  socket.on("participants_update", (data) => {
-    setParticipants(data.participants || []);
-  });
-
-  // ✅ FIXED: Session ended handler
-  socket.on("session_ended", (data) => {
-    console.log("📨 Session ended with data:", data);
-    
-    // Get feedback directly from data.feedback
-    const feedback = data?.feedback || "Session ended. Thank you for participating!";
-    
-    // Navigate to feedback page
-    navigate("/feedback", { 
-      state: { 
-        feedback: feedback,
-        room_id: data?.room_id 
-      } 
-    });
-    
-    setIsLoadingFeedback(false);
-  });
-
-  // If already connected, join room immediately
-  if (socket.connected) {
-    socket.emit("join_room", { room_id: roomId, user_name: userName });
-  } else {
-    socket.connect();
-  }
-
-  return () => {
-    socket.off("connect");
-    socket.off("disconnect");
-    socket.off("connect_error");
-    socket.off("joined_room");
-    socket.off("chat_history");
-    socket.off("receive_message");
-    socket.off("participants_update");
-    socket.off("session_ended");
-  };
-}, [roomId, userName, navigate]);
+    return () => {
+      socket.off("connect");
+      socket.off("disconnect");
+      socket.off("connect_error");
+      socket.off("joined_room");
+      socket.off("chat_history");
+      socket.off("receive_message");
+      socket.off("participants_update");
+      socket.off("time_warning");
+      socket.off("ranking_submitted");
+      socket.off("session_ended");
+    };
+  }, [roomId, userName, navigate]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -185,30 +250,26 @@ useEffect(() => {
   }, [messages]);
 
   // ============================================================
-  // 💬 SEND MESSAGE - TEXT ONLY
+  // 💬 SEND MESSAGE
   // ============================================================
   const sendMessage = useCallback(() => {
     const trimmed = message.trim();
     if (!trimmed || !ready) return;
 
-    // Play send sound
     sendSound.play().catch(() => {});
 
-    // Add message locally immediately
     setMessages(prev => [...prev, { 
       sender: userName, 
       message: trimmed, 
       timestamp: new Date().toISOString() 
     }]);
 
-    // Send to server
     socket.emit("send_message", {
       room_id: roomId,
       message: trimmed,
       sender: userName,
     });
 
-    // Clear input
     setMessage("");
   }, [message, roomId, userName, ready, sendSound]);
 
@@ -217,6 +278,50 @@ useEffect(() => {
       e.preventDefault();
       sendMessage();
     }
+  };
+
+  // ============================================================
+  // 📊 RANKING INTERFACE HANDLERS
+  // ============================================================
+  const handleDragStart = (e, index) => {
+    setDraggedItem(index);
+    e.dataTransfer.setData("text/plain", index);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+  };
+
+  const handleDrop = (e, targetIndex) => {
+    e.preventDefault();
+    const sourceIndex = draggedItem;
+    if (sourceIndex === null || sourceIndex === targetIndex) return;
+
+    const newRanking = [...ranking];
+    const [movedItem] = newRanking.splice(sourceIndex, 1);
+    newRanking.splice(targetIndex, 0, movedItem);
+    setRanking(newRanking);
+    setDraggedItem(null);
+  };
+
+  const startRanking = () => {
+    setRanking([...DESERT_ITEMS]);
+  };
+
+  const resetRanking = () => {
+    setRanking([]);
+  };
+
+  const submitRanking = () => {
+    if (ranking.length !== 12) {
+      alert("Please rank all 12 items");
+      return;
+    }
+
+    socket.emit("submit_ranking", {
+      room_id: roomId,
+      ranking: ranking
+    });
   };
 
   // ============================================================
@@ -230,16 +335,112 @@ useEffect(() => {
   };
 
   // ============================================================
-  // 🎨 UI RENDER - PURE TEXT, NO VOICE BUTTONS
+  // 📊 RANKING MODAL COMPONENT
   // ============================================================
-  
-  // Calculate online count - at least 1 (yourself)
+  const RankingModal = () => (
+    <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+        <div className="p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-2xl font-bold text-gray-800">
+              {timeWarning ? "⏰ Time's Running Out!" : "Final Ranking"}
+            </h3>
+            {timeWarning && (
+              <span className="px-3 py-1 bg-red-100 text-red-700 rounded-full text-sm font-semibold flex items-center gap-1">
+                <MdWarning /> 2 minutes left
+              </span>
+            )}
+          </div>
+          
+          <p className="text-gray-600 mb-4">
+            Drag and drop items to rank them from 1 (most important for survival) to 12 (least important).
+            Your group must agree on one final ranking.
+          </p>
+          
+          {ranking.length === 0 ? (
+            <div className="space-y-2 mb-6">
+              {DESERT_ITEMS.map((item, index) => (
+                <div
+                  key={index}
+                  className="p-3 bg-gray-50 border border-gray-200 rounded-lg text-gray-700"
+                >
+                  {item}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-2 mb-6">
+              {ranking.map((item, index) => (
+                <div
+                  key={index}
+                  draggable
+                  onDragStart={(e) => handleDragStart(e, index)}
+                  onDragOver={handleDragOver}
+                  onDrop={(e) => handleDrop(e, index)}
+                  className={`flex items-center gap-3 p-3 bg-white border-2 rounded-lg cursor-move transition-all ${
+                    draggedItem === index 
+                      ? 'border-indigo-500 bg-indigo-50 shadow-lg' 
+                      : 'border-gray-200 hover:border-indigo-300 hover:bg-gray-50'
+                  }`}
+                >
+                  <MdDragHandle className="text-gray-400 text-xl" />
+                  <span className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold">
+                    {index + 1}
+                  </span>
+                  <span className="font-medium text-gray-700 flex-1">{item}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          
+          <div className="flex gap-3 mt-6 pt-4 border-t border-gray-200">
+            {ranking.length === 0 ? (
+              <button
+                onClick={startRanking}
+                className="flex-1 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-colors font-medium"
+              >
+                Start Ranking
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={resetRanking}
+                  className="flex-1 py-3 border-2 border-gray-300 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors font-medium"
+                >
+                  Reset
+                </button>
+                <button
+                  onClick={submitRanking}
+                  disabled={rankingSubmitted}
+                  className="flex-1 py-3 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {rankingSubmitted ? (
+                    <>Submitted <MdCheckCircle /></>
+                  ) : (
+                    'Submit Ranking'
+                  )}
+                </button>
+              </>
+            )}
+          </div>
+          
+          {ranking.length === 12 && (
+            <p className="text-xs text-gray-500 mt-3 text-center">
+              Drag items to reorder. Click Submit when your group agrees.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  // Calculate online count
   const onlineCount = Math.max(participants.length, 1);
 
   return (
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50">
       
-      {/* 🎪 CLEAN HEADER - NO TTS BUTTONS */}
+      {/* 🎪 HEADER */}
       <div className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white">
         <div className="px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -247,25 +448,24 @@ useEffect(() => {
               <MdChat className="text-xl" />
             </div>
             <div>
-              <h1 className="font-bold text-lg">Collaborative Storytelling</h1>
+              <h1 className="font-bold text-lg">Desert Survival Task</h1>
               <div className="flex items-center gap-2 text-sm opacity-90">
                 <span className="font-mono">Room: {roomId.substring(0, 8)}...</span>
                 
-                {/* ONLINE COUNT - ALWAYS SHOWS AT LEAST 1 */}
                 <span className="px-2 py-0.5 bg-green-500/30 rounded-full text-xs flex items-center gap-1">
                   <span className="w-1.5 h-1.5 bg-green-300 rounded-full"></span>
-                  {onlineCount} online
+                  {onlineCount}/3 online
                 </span>
 
-                {/* CONNECTION STATUS */}
+                {timeWarning && (
+                  <span className="px-2 py-0.5 bg-red-500/30 rounded-full text-xs animate-pulse">
+                    ⏰ 2 min left
+                  </span>
+                )}
+
                 {connectionStatus === "disconnected" && (
                   <span className="px-2 py-0.5 bg-red-500/30 rounded-full text-xs">
                     Disconnected
-                  </span>
-                )}
-                {connectionStatus === "connecting" && (
-                  <span className="px-2 py-0.5 bg-yellow-500/30 rounded-full text-xs">
-                    Connecting...
                   </span>
                 )}
               </div>
@@ -273,7 +473,6 @@ useEffect(() => {
           </div>
           
           <div className="flex items-center gap-2">
-            {/* Copy Room ID - ONLY BUTTON IN HEADER */}
             <button
               onClick={() => {
                 navigator.clipboard.writeText(roomId);
@@ -286,7 +485,6 @@ useEffect(() => {
               {copied ? "Copied!" : "Copy ID"}
             </button>
             
-            {/* Participants Toggle */}
             <button
               onClick={() => setShowParticipants(!showParticipants)}
               className="p-2 rounded-lg hover:bg-white/20 transition-colors"
@@ -298,7 +496,7 @@ useEffect(() => {
         </div>
       </div>
 
-      {/* 📱 MAIN CONTENT AREA */}
+      {/* 📱 MAIN CONTENT */}
       <div className="flex flex-1 overflow-hidden">
         
         {/* 💬 CHAT MESSAGES */}
@@ -312,20 +510,22 @@ useEffect(() => {
                   <div className="w-20 h-20 rounded-full bg-gradient-to-r from-indigo-100 to-purple-100 flex items-center justify-center mx-auto mb-4">
                     <MdChat className="text-3xl text-indigo-500" />
                   </div>
-                  <h2 className="text-2xl font-bold text-gray-800 mb-2">Welcome to the Story!</h2>
-                  <p className="text-gray-600">
-                    Start writing your part of the story. The AI moderator will guide the narrative.
+                  <h2 className="text-2xl font-bold text-gray-800 mb-2">Desert Survival Task</h2>
+                  <p className="text-gray-600 mb-4">
+                    Your group must rank 12 items in order of importance for survival.
+                    Discuss with your teammates and reach a consensus.
                   </p>
-                  <p className="text-sm text-gray-500 mt-4">
-                    Type your message below and press Enter to send.
+                  <p className="text-sm text-gray-500">
+                    You have 15 minutes. A ranking interface will appear when time is running out.
                   </p>
                 </div>
               </div>
             ) : (
               messages.map((msg, index) => {
                 const isModerator = msg.sender === "Moderator";
+                const isSystem = msg.sender === "System";
                 const isCurrentUser = msg.sender === userName;
-                const userColor = !isModerator ? getUserColor(msg.sender, userName) : null;
+                const userColor = !isModerator && !isSystem ? getUserColor(msg.sender, userName) : null;
                 const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString([], { 
                   hour: '2-digit', 
                   minute: '2-digit' 
@@ -342,6 +542,10 @@ useEffect(() => {
                         <div className="w-10 h-10 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 flex items-center justify-center text-white">
                           <MdChat size={20} />
                         </div>
+                      ) : isSystem ? (
+                        <div className="w-10 h-10 rounded-full bg-gray-500 flex items-center justify-center text-white">
+                          <MdCheckCircle size={20} />
+                        </div>
                       ) : (
                         <div className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-bold ${userColor?.accent || 'bg-gray-500'}`}>
                           {msg.sender.charAt(0)}
@@ -349,10 +553,14 @@ useEffect(() => {
                       )}
                     </div>
                     
-                    {/* Message Bubble - NO TTS BUTTONS */}
+                    {/* Message Bubble */}
                     <div className={`max-w-xl ${isCurrentUser ? 'text-right' : ''}`}>
                       <div className="flex items-center gap-2 mb-1">
-                        <span className={`font-semibold text-sm ${isModerator ? 'text-amber-700' : userColor?.text || 'text-gray-700'}`}>
+                        <span className={`font-semibold text-sm ${
+                          isModerator ? 'text-amber-700' : 
+                          isSystem ? 'text-gray-600' :
+                          userColor?.text || 'text-gray-700'
+                        }`}>
                           {isCurrentUser ? 'You' : msg.sender}
                         </span>
                         <span className="text-xs text-gray-500">{timestamp}</span>
@@ -362,6 +570,8 @@ useEffect(() => {
                         className={`rounded-2xl px-4 py-3 shadow-sm ${
                           isModerator
                             ? 'bg-gradient-to-r from-amber-50 to-yellow-50 border border-amber-200'
+                            : isSystem
+                            ? 'bg-gray-100 border border-gray-200 text-gray-600'
                             : isCurrentUser
                             ? 'bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-br-none'
                             : `${userColor?.bg || 'bg-gray-100'} border ${userColor?.border || 'border-gray-200'} rounded-bl-none`
@@ -379,7 +589,7 @@ useEffect(() => {
             <div ref={messagesEndRef} />
           </div>
 
-          {/* ✍️ TEXT INPUT - PURE, NO EXTRAS */}
+          {/* ✍️ TEXT INPUT */}
           <div className="border-t bg-white/90 backdrop-blur-sm p-4">
             <div className="max-w-4xl mx-auto">
               <div className="flex gap-3">
@@ -390,20 +600,17 @@ useEffect(() => {
                     onChange={(e) => setMessage(e.target.value.substring(0, 1000))}
                     onKeyDown={handleKeyPress}
                     placeholder={ready ? 
-                      "Write your part of the story here... (Press Enter to send, Shift+Enter for new line)" : 
+                      "Discuss the items with your group... (Press Enter to send)" : 
                       "Connecting to room..."
                     }
                     disabled={!ready}
                     className="w-full px-4 py-3 bg-white border border-gray-300 rounded-2xl focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100 resize-none transition-all disabled:bg-gray-100 disabled:cursor-not-allowed"
                   />
-                  
-                  {/* Simple character counter */}
                   <div className="absolute right-3 bottom-3 text-xs text-gray-400">
                     {message.length}/1000
                   </div>
                 </div>
                 
-                {/* Send Button */}
                 <button
                   onClick={sendMessage}
                   disabled={!message.trim() || !ready}
@@ -414,7 +621,6 @@ useEffect(() => {
                 </button>
               </div>
               
-              {/* Simple status line */}
               <div className="mt-2 text-xs text-gray-500 flex justify-between">
                 <span>
                   {ready ? (
@@ -424,7 +630,6 @@ useEffect(() => {
                   )}
                 </span>
                 
-                {/* End Session Button */}
                 <button
                   onClick={endSession}
                   disabled={isLoadingFeedback}
@@ -453,12 +658,12 @@ useEffect(() => {
             <div className="p-4 border-b">
               <h3 className="font-semibold text-gray-800 flex items-center gap-2">
                 <MdPerson />
-                Participants ({onlineCount})
+                Participants ({onlineCount}/3)
               </h3>
             </div>
             
             <div className="p-4 space-y-3">
-              {/* Always show current user */}
+              {/* Current user */}
               <div className="flex items-center gap-3 p-2 rounded-lg bg-indigo-50 border border-indigo-100">
                 <div className="w-8 h-8 rounded-full bg-gradient-to-r from-blue-500 to-indigo-500 flex items-center justify-center text-white font-bold">
                   {userName.charAt(0)}
@@ -495,6 +700,13 @@ useEffect(() => {
                     </div>
                   );
                 })}
+              
+              {/* Waiting for participants */}
+              {participants.length < 3 && (
+                <div className="text-center py-4 text-gray-500 text-sm border-t border-gray-100">
+                  Waiting for {3 - participants.length} more participant(s)...
+                </div>
+              )}
             </div>
             
             <div className="p-4 border-t">
@@ -502,12 +714,15 @@ useEffect(() => {
                 <p className="font-medium text-gray-700">Room Information</p>
                 <p className="truncate">ID: <span className="font-mono">{roomId.substring(0, 8)}...</span></p>
                 <p>Messages: {messages.length}</p>
-                <p className="pt-2 text-indigo-600 font-medium">✨ Pure text collaboration</p>
+                <p className="pt-2 text-indigo-600 font-medium">🏜️ Desert Survival Task</p>
               </div>
             </div>
           </div>
         )}
       </div>
+
+      {/* 📊 RANKING MODAL */}
+      {showRankingModal && !rankingSubmitted && <RankingModal />}
     </div>
   );
 }

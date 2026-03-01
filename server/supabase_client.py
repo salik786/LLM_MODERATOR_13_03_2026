@@ -8,6 +8,7 @@ Includes ALL functions for admin panel, session summaries, and exports.
 import os
 import uuid
 import logging
+import json
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 from supabase import create_client, Client
@@ -37,22 +38,35 @@ logger.info("✅ Supabase client initialized")
 # ============================================================
 
 def find_available_room(mode: str) -> Optional[Dict[str, Any]]:
-    """Find a room with available space for the given mode."""
+    """
+    Find a room with available space for the given mode.
+    FIXED: Correctly checks participant_count against max_participants
+    """
     try:
+        # First get all waiting/active rooms
         response = (
             supabase.table("rooms")
             .select("*")
             .eq("mode", mode)
             .in_("status", ["waiting", "active"])
-            .lt("participant_count", 3)
-            .order("created_at", desc=False)
-            .limit(1)
             .execute()
         )
-
-        if response.data and len(response.data) > 0:
-            room = response.data[0]
-            logger.info(f"✅ Found available room: {room['id']} (status={room['status']}, participants={room.get('participant_count', 0)}/3)")
+        
+        if not response.data:
+            logger.info(f"ℹ️ No rooms found for mode: {mode}")
+            return None
+        
+        # Filter rooms where participant_count < max_participants
+        available_rooms = [
+            room for room in response.data 
+            if room.get('participant_count', 0) < room.get('max_participants', 3)
+        ]
+        
+        if available_rooms:
+            # Sort by created_at and return the oldest
+            available_rooms.sort(key=lambda x: x.get('created_at', ''))
+            room = available_rooms[0]
+            logger.info(f"✅ Found available room: {room['id']} (status={room['status']}, participants={room.get('participant_count', 0)}/{room.get('max_participants', 3)})")
             return room
 
         logger.info(f"ℹ️ No available room found for mode: {mode}, will create new room")
@@ -61,7 +75,7 @@ def find_available_room(mode: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"❌ Error finding available room: {e}")
         return None
-
+    
 def create_room(mode: str, story_id: Optional[str] = None, max_participants: int = 3, created_by: str = 'system') -> Dict[str, Any]:
     """Create a new room."""
     try:
@@ -163,7 +177,8 @@ def add_participant(
     room_id: str,
     username: str,
     socket_id: str,
-    display_name: Optional[str] = None
+    display_name: Optional[str] = None,
+    
 ) -> Dict[str, Any]:
     """Add participant to room with proper display_name storage - FIXED VERSION"""
     try:
@@ -184,7 +199,9 @@ def add_participant(
             "username": username,
             "socket_id": socket_id,
             "display_name": display_name or username,
-            "joined_at": datetime.now(timezone.utc).isoformat()
+        
+            "joined_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }
         
         response = (
@@ -265,7 +282,7 @@ def get_participants_with_details(room_id: str) -> List[Dict[str, Any]]:
     try:
         response = (
             supabase.table("participants")
-            .select("id, username, display_name, socket_id, joined_at")
+            .select("id, username, display_name, socket_id, joined_at, anonymous_id")
             .eq("room_id", room_id)
             .order("joined_at", desc=False)
             .execute()
@@ -292,7 +309,7 @@ def get_participant_by_socket(socket_id: str) -> Optional[Dict[str, Any]]:
             supabase.table("participants")
             .select("*")
             .eq("socket_id", socket_id)
-            .single()
+            .maybe_single()
             .execute()
         )
         return response.data
@@ -309,7 +326,7 @@ def get_participant_by_username(room_id: str, username: str) -> Optional[Dict[st
             .select("*")
             .eq("room_id", room_id)
             .eq("username", username)
-            .maybe_single()  # Use maybe_single instead of single to avoid 404
+            .maybe_single()
             .execute()
         )
         
@@ -330,6 +347,7 @@ def get_participant_by_username(room_id: str, username: str) -> Optional[Dict[st
     except Exception as e:
         logger.error(f"Error getting participant by username: {e}")
         return None
+
 # ============================================================
 # Message Operations
 # ============================================================
@@ -341,13 +359,17 @@ def add_message(
     message_type: str = "chat",
     metadata: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Add message to room with metadata support."""
+    """Add message to room with metadata support and word count."""
     try:
+        # Calculate word count
+        word_count = len(message.split())
+        
         message_data = {
             "room_id": room_id,
             "username": username,
             "message": message,
             "message_type": message_type,
+            "word_count": word_count,
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         
@@ -361,7 +383,7 @@ def add_message(
         )
 
         msg = response.data[0]
-        logger.debug(f"📝 Added message from {username} in room {room_id}")
+        logger.debug(f"📝 Added message from {username} in room {room_id} ({word_count} words)")
         return msg
 
     except Exception as e:
@@ -390,7 +412,7 @@ def get_messages_for_export(room_id: str) -> List[Dict[str, Any]]:
     try:
         response = (
             supabase.table("messages")
-            .select("id, username, message, message_type, created_at, metadata")
+            .select("id, username, message, message_type, created_at, metadata, word_count")
             .eq("room_id", room_id)
             .order("created_at", desc=False)
             .execute()
@@ -446,18 +468,39 @@ def end_session(room_id: str, ended_by: str = 'system', end_reason: str = 'compl
             ended_at = datetime.now(timezone.utc)
             duration_seconds = int((ended_at - started_at).total_seconds())
             
+            # Get message count
+            messages = get_chat_history(room_id)
+            message_count = len(messages)
+            
             update_data = {
                 "ended_at": ended_at.isoformat(),
                 "is_active": False,
                 "ended_by": ended_by,
                 "end_reason": end_reason,
-                "duration_seconds": duration_seconds
+                "duration_seconds": duration_seconds,
+                "message_count": message_count
             }
             
             supabase.table("sessions").update(update_data).eq("room_id", room_id).is_("ended_at", "null").execute()
-            logger.info(f"Ended session for room {room_id} (duration: {duration_seconds}s)")
+            logger.info(f"Ended session for room {room_id} (duration: {duration_seconds}s, messages: {message_count})")
     except Exception as e:
         logger.error(f"Error ending session: {e}")
+
+def get_session(room_id: str) -> Optional[Dict[str, Any]]:
+    """Get active session for room."""
+    try:
+        response = (
+            supabase.table("sessions")
+            .select("*")
+            .eq("room_id", room_id)
+            .is_("ended_at", "null")
+            .maybe_single()
+            .execute()
+        )
+        return response.data
+    except Exception as e:
+        logger.error(f"Error getting session: {e}")
+        return None
 
 # ============================================================
 # STUDENT BEHAVIOR ANALYSIS - For Personalized Feedback
@@ -589,6 +632,7 @@ def create_room_admin(
             "story_finished": False,
             "created_by": created_by,
             "admin_note": admin_note,
+            "condition": mode,  # For research tracking
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
@@ -803,7 +847,7 @@ def get_setting(key: str, default: Any = None) -> Any:
             supabase.table("settings")
             .select("*")
             .eq("key", key)
-            .single()
+            .maybe_single()
             .execute()
         )
         
@@ -905,6 +949,231 @@ def get_or_create_room(mode: str, story_id: Optional[str] = None) -> Dict[str, A
     if room:
         return room
     return create_room(mode, story_id)
+
+# ============================================================
+# RESEARCH FUNCTIONS
+# ============================================================
+
+def calculate_gini_coefficient(message_counts: List[int]) -> float:
+    """Calculate Gini coefficient for participation equality"""
+    if not message_counts or sum(message_counts) == 0:
+        return 0
+    
+    sorted_counts = sorted(message_counts)
+    n = len(sorted_counts)
+    gini = 0
+    
+    for i, count in enumerate(sorted_counts):
+        gini += (2*i - n + 1) * count
+    
+    if sum(sorted_counts) > 0:
+        gini = gini / (n * sum(sorted_counts))
+    
+    return max(0, min(gini, 1))
+
+def save_room_metrics(room_id: str):
+    """Calculate and save all research metrics for a room"""
+    try:
+        # Get room info
+        room = get_room(room_id)
+        if not room:
+            return
+        
+        # Get all messages
+        messages = get_chat_history(room_id)
+        
+        # Get all participants
+        participants = get_participants(room_id)
+        
+        # Count messages per participant (excluding moderator)
+        message_counts = []
+        word_counts = []
+        participant_data = []
+        
+        for p in participants:
+            if p['username'] == 'Moderator':
+                continue
+            
+            p_messages = [m for m in messages if m.get('username') == p['username']]
+            msg_count = len(p_messages)
+            word_count = sum(len(m.get('message', '').split()) for m in p_messages)
+            
+            message_counts.append(msg_count)
+            word_counts.append(word_count)
+            
+            participant_data.append({
+                'username': p['username'],
+                'message_count': msg_count,
+                'word_count': word_count
+            })
+        
+        # Calculate metrics
+        total_messages = sum(message_counts)
+        total_words = sum(word_counts)
+        
+        # Speaking shares
+        shares = [c/total_messages if total_messages > 0 else 0 for c in message_counts]
+        
+        # Gini coefficient
+        gini = calculate_gini_coefficient(message_counts)
+        
+        # Dominance metrics
+        max_share = max(shares) if shares else 0
+        min_share = min(shares) if shares else 0
+        dominance_gap = max_share - min_share
+        
+        # Save to research_metrics table
+        metrics_data = {
+            "room_id": room_id,
+            "condition": room.get('mode'),
+            "gini_coefficient": gini,
+            "max_share": max_share,
+            "min_share": min_share,
+            "dominance_gap": dominance_gap,
+            "total_messages": total_messages,
+            "total_words": total_words,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Add ranking accuracy if available
+        if room.get('final_ranking'):
+            from data_retriever import compare_with_expert_ranking
+            ranking = json.loads(room.get('final_ranking'))
+            comparison = compare_with_expert_ranking(ranking)
+            metrics_data["ranking_accuracy"] = comparison['accuracy_percentage']
+        
+        supabase.table("research_metrics").insert(metrics_data).execute()
+        
+        # Save participant metrics
+        for i, p_data in enumerate(participant_data):
+            p_metrics = {
+                "room_id": room_id,
+                "username": p_data['username'],
+                "message_count": p_data['message_count'],
+                "word_count": p_data['word_count'],
+                "share_of_talk": shares[i] if i < len(shares) else 0,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            supabase.table("participant_metrics").insert(p_metrics).execute()
+        
+        logger.info(f"✅ Saved research metrics for room {room_id}")
+        return metrics_data
+        
+    except Exception as e:
+        logger.error(f"❌ Error saving room metrics: {e}")
+        return None
+
+def log_moderator_intervention(room_id: str, intervention_type: str, target_user: Optional[str] = None):
+    """Log a moderator intervention for research"""
+    try:
+        data = {
+            "room_id": room_id,
+            "intervention_type": intervention_type,
+            "target_user": target_user,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        supabase.table("moderator_interventions").insert(data).execute()
+        logger.debug(f"📝 Logged intervention: {intervention_type} in room {room_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to log intervention: {e}")
+
+def detect_conflict(message: str) -> tuple[bool, int]:
+    """Detect if a message contains conflict and return severity"""
+    conflict_keywords = [
+        ('disagree', 2), ('wrong', 2), ('no', 1), ('but', 1), 
+        ('actually', 1), ("you're wrong", 3), ("that's not", 2),
+        ('stupid', 3), ('ridiculous', 3), ('idiot', 3), ('dumb', 3),
+        ('nonsense', 2), ('not true', 2), ('incorrect', 2), ('false', 2),
+        ('mistake', 1), ('error', 1), ("don't understand", 2),
+        ("not getting it", 2)
+    ]
+    
+    message_lower = message.lower()
+    severity = 0
+    
+    for keyword, score in conflict_keywords:
+        if keyword in message_lower:
+            severity += score
+    
+    return severity > 0, severity
+
+def detect_repair(message: str) -> bool:
+    """Detect if a message is a repair attempt"""
+    repair_keywords = [
+        'agree', 'okay', 'fair', 'point', 'understand', 'see your',
+        'youre right', 'good point', 'makes sense', 'lets move on',
+        'compromise', 'both valid', 'i see', 'sorry', 'my bad'
+    ]
+    
+    message_lower = message.lower()
+    for keyword in repair_keywords:
+        if keyword in message_lower:
+            return True
+    return False
+
+def analyze_conflict_episodes(room_id: str):
+    """Analyze all messages in a room for conflict-repair sequences"""
+    try:
+        messages = get_chat_history(room_id)
+        conflicts = []
+        
+        for i, msg in enumerate(messages):
+            if msg.get('username') == 'Moderator':
+                continue
+            
+            is_conflict, severity = detect_conflict(msg.get('message', ''))
+            if is_conflict:
+                # Look for repair in next 5 messages
+                repair_found = False
+                repair_time = None
+                repair_user = None
+                repair_msg = None
+                
+                for j in range(i+1, min(i+6, len(messages))):
+                    repair_msg = messages[j]
+                    if repair_msg.get('username') == 'Moderator':
+                        continue
+                    
+                    if detect_repair(repair_msg.get('message', '')):
+                        repair_found = True
+                        try:
+                            conflict_time = datetime.fromisoformat(msg['created_at'].replace('Z', '+00:00'))
+                            repair_time_obj = datetime.fromisoformat(repair_msg['created_at'].replace('Z', '+00:00'))
+                            repair_time = int((repair_time_obj - conflict_time).total_seconds())
+                        except:
+                            repair_time = None
+                        repair_user = repair_msg.get('username')
+                        break
+                
+                conflict_data = {
+                    "room_id": room_id,
+                    "conflict_message_id": msg.get('id'),
+                    "conflict_user": msg.get('username'),
+                    "conflict_text": msg.get('message'),
+                    "severity_score": severity,
+                    "repair_message_id": repair_msg.get('id') if repair_found and repair_msg else None,
+                    "repair_user": repair_user,
+                    "time_to_repair": repair_time,
+                    "resolved": repair_found
+                }
+                
+                # Check if table exists before inserting
+                try:
+                    supabase.table("conflict_episodes").insert(conflict_data).execute()
+                except:
+                    # Table might not exist yet
+                    pass
+                
+                conflicts.append(conflict_data)
+        
+        logger.info(f"✅ Analyzed {len(conflicts)} conflicts for room {room_id}")
+        return conflicts
+        
+    except Exception as e:
+        logger.error(f"❌ Error analyzing conflicts: {e}")
+        return []
 
 # ============================================================
 # Cleanup Operations (Optional)

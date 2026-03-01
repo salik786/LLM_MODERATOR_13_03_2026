@@ -1,4 +1,8 @@
-
+# ============================================================
+# LLM Moderator Server with Supabase Integration - RESEARCH VERSION
+# WITH DESERT SURVIVAL TASK AND ACTIVE/PASSIVE MODERATION
+# Following exact experiment design specifications
+# ============================================================
 from __future__ import annotations
 
 import os
@@ -10,6 +14,7 @@ import sys
 import json
 import csv
 import random
+import traceback  # Add this line
 from io import BytesIO, StringIO
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
@@ -46,27 +51,39 @@ from supabase_client import (
     supabase,
     create_room as supabase_create_room,
     analyze_student_behavior,
+    save_room_metrics,
+    log_moderator_intervention,
+    analyze_conflict_episodes
 )
 
 # ============================================================
-# Import Story System
+# Import Research Metrics
+# ============================================================
+from research_metrics import (
+    calculate_gini_coefficient,
+    analyze_participation,
+    detect_conflict_episodes,
+)
+
+# ============================================================
+# Import Task System (Desert Survival)
 # ============================================================
 from data_retriever import (
     get_data,
     format_story_block,
     get_story_intro,
+    get_task_items,
+    compare_with_expert_ranking
 )
 
 # ============================================================
 # Import Prompt Functions
 # ============================================================
 from prompts import (
-    generate_moderator_reply,
-    generate_passive_chunk,
-    get_random_ending,
-    generate_engagement_response,
-    should_advance_story,
+    generate_active_moderator_response,
+    generate_passive_moderator_response,
     generate_personalized_feedback,
+    get_random_ending,
 )
 
 # ============================================================
@@ -85,7 +102,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("LLM_MODERATOR")
 logger.info("="*60)
-logger.info("🚀 LLM Moderator Server Starting - WITH FIXED FEEDBACK DELIVERY")
+logger.info("🚀 LLM Moderator Research Server Starting")
 logger.info("="*60)
 
 # ============================================================
@@ -131,9 +148,8 @@ socketio = SocketIO(
     async_mode="threading",
     logger=True,
     engineio_logger=True,
-    # 👇 CRITICAL FIX: Force polling only
-    transports=['polling'],  # Only use polling
-    allow_upgrades=False,     # Never upgrade to websocket
+    transports=['polling'],
+    allow_upgrades=False,
     ping_timeout=60,
     ping_interval=25,
     max_http_buffer_size=1e8
@@ -144,17 +160,35 @@ socketio = SocketIO(
 # ============================================================
 active_monitors: Dict[str, threading.Thread] = {}
 room_sessions: Dict[str, str] = {}  # room_id -> session_id
+research_timers: Dict[str, threading.Thread] = {}  # room_id -> timer thread
 
 # ============================================================
 # Groq Client Setup
 # ============================================================
 groq_client = None
+openai_client = None
+
+# Try to initialize OpenAI first
+try:
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=openai_api_key)
+        logger.info("✅ OpenAI client initialized")
+    else:
+        logger.warning("⚠️ OPENAI_API_KEY not found")
+except ImportError:
+    logger.warning("⚠️ openai package not installed")
+except Exception as e:
+    logger.error(f"❌ Error initializing OpenAI client: {e}")
+
+# Try Groq as fallback
 try:
     from groq import Groq
     groq_api_key = os.getenv("GROQ_API_KEY")
     if groq_api_key:
         groq_client = Groq(api_key=groq_api_key)
-        logger.info("✅ Groq client initialized")
+        logger.info("✅ Groq client initialized as fallback")
     else:
         logger.warning("⚠️ GROQ_API_KEY not found")
 except ImportError:
@@ -176,23 +210,18 @@ logger.info("✅ Admin API registered at /admin")
 logger.info("📝 Loading configuration from database...")
 
 WELCOME_MESSAGE = get_setting_value("WELCOME_MESSAGE", "Welcome everyone! I'm the Moderator.")
-ACTIVE_STORY_STEP = get_setting_value("ACTIVE_STORY_STEP", 1)
-PASSIVE_STORY_STEP = get_setting_value("PASSIVE_STORY_STEP", 1)
-PASSIVE_SILENCE_SECONDS = get_setting_value("PASSIVE_SILENCE_SECONDS", 10)
-ACTIVE_SILENCE_SECONDS = get_setting_value("ACTIVE_SILENCE_SECONDS", 20)
-STORY_CHUNK_INTERVAL = get_setting_value("STORY_CHUNK_INTERVAL", 10)
-ACTIVE_INTERVENTION_WINDOW_SECONDS = get_setting_value("ACTIVE_INTERVENTION_WINDOW_SECONDS", 20)
-PASSIVE_INTERVENTION_WINDOW_SECONDS = get_setting_value("PASSIVE_INTERVENTION_WINDOW_SECONDS", 10)
-
-# Load Groq-specific settings
+LLM_PROVIDER = get_setting_value("LLM_PROVIDER", "groq")
 GROQ_MODEL = get_setting_value("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_TEMPERATURE = get_setting_value("GROQ_TEMPERATURE", 0.7)
 GROQ_MAX_TOKENS = get_setting_value("GROQ_MAX_TOKENS", 2000)
-LLM_PROVIDER = get_setting_value("LLM_PROVIDER", "groq")
 
-logger.info(f"📝 Config: Active Step={ACTIVE_STORY_STEP}, Passive Step={PASSIVE_STORY_STEP}")
-logger.info(f"📝 Config: Story Interval={STORY_CHUNK_INTERVAL}s")
+# Research settings - FROM YOUR EXPERIMENT DESIGN
+SILENCE_THRESHOLD_SECONDS = 180  # 3 minutes - if someone hasn't spoken for 3 minutes, invite them
+DOMINANCE_THRESHOLD = 0.5  # 50% of recent messages - if one person contributes >50%, balance
+TIME_WARNING_MINUTES = 5  # Warn when 5 minutes remaining
+
 logger.info(f"📝 Config: LLM Provider={LLM_PROVIDER}, Model={GROQ_MODEL}")
+logger.info(f"📝 Research Settings: Silence={SILENCE_THRESHOLD_SECONDS}s, Dominance Threshold={DOMINANCE_THRESHOLD*100}%")
 logger.info(f"📝 Frontend URL: {FRONTEND_URL}")
 
 # ============================================================
@@ -337,22 +366,80 @@ def export_room_full(room_id: str):
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
-# Helper: Get Room Story Data
+# Helper: Get Room Task Data
 # ============================================================
-def get_room_story_data(room_id: str) -> Optional[Dict[str, Any]]:
-    """Load story data for room"""
+def get_room_task_data(room_id: str) -> Optional[Dict[str, Any]]:
+    """Load task data for room (always desert survival)"""
     room = get_room(room_id)
-    if not room or not room.get('story_id'):
-        logger.warning(f"⚠️ No story data for room {room_id}")
+    if not room:
+        logger.warning(f"⚠️ No room found {room_id}")
         return None
 
-    return get_data(room['story_id'])
+    return get_data()  # Always returns desert survival task
 
 # ============================================================
-# Helper: Start Story
+# RESEARCH TIMER - 15 Minute Session Timer
 # ============================================================
-def start_story_for_room(room_id: str):
-    """Start story for a room when conditions are met"""
+def start_research_timer(room_id: str):
+    """15-minute timer with warnings for research sessions"""
+    
+    def timer_loop():
+        # Wait 10 minutes (5 minutes remaining warning)
+        time.sleep(10 * 60)
+        
+        room = get_room(room_id)
+        if room and room['status'] == 'active':
+            # 5 minutes remaining warning - FROM YOUR DESIGN
+            warning_msg = "⚠️ **5 minutes remaining!** Please work towards your final ranking. Can you agree on your top 3 items?"
+            add_message(
+                room_id=room_id,
+                username="Moderator",
+                message=warning_msg,
+                message_type="system"
+            )
+            
+            socketio.emit(
+                "receive_message",
+                {"sender": "Moderator", "message": warning_msg},
+                room=room_id,
+            )
+            
+            # Wait 4 more minutes
+            time.sleep(4 * 60)
+            
+            # 1 minute remaining
+            final_warning = "⏰ **1 minute remaining!** Please submit your final ranking now."
+            add_message(
+                room_id=room_id,
+                username="Moderator",
+                message=final_warning,
+                message_type="system"
+            )
+            
+            socketio.emit(
+                "receive_message",
+                {"sender": "Moderator", "message": final_warning},
+                room=room_id,
+            )
+            
+            # Give 1 more minute for submission
+            time.sleep(60)
+            
+            # Auto-end session if not already ended
+            room = get_room(room_id)
+            if room and room['status'] == 'active':
+                handle_end_session({"room_id": room_id, "sender": "system"})
+    
+    thread = threading.Thread(target=timer_loop, daemon=True)
+    thread.start()
+    research_timers[room_id] = thread
+    logger.info(f"⏰ Research timer started for room {room_id} (15 minutes)")
+
+# ============================================================
+# Helper: Start Task
+# ============================================================
+def start_task_for_room(room_id: str):
+    """Start desert survival task for a room when conditions are met"""
     try:
         room = get_room(room_id)
         if not room:
@@ -364,6 +451,7 @@ def start_story_for_room(room_id: str):
 
         logger.info(f"📊 Room {room_id}: {student_count} students, status={room['status']}")
 
+        # RESEARCH: Only start when EXACTLY 3 participants
         if room['status'] == 'active':
             logger.info(f"ℹ️ Room {room_id} already active")
             return
@@ -371,11 +459,12 @@ def start_story_for_room(room_id: str):
             logger.info(f"ℹ️ Room {room_id} already completed")
             return
 
-        if student_count < 1:
-            logger.info(f"ℹ️ Room {room_id} waiting for participants (current: {student_count})")
+        # RESEARCH: Wait for exactly 3 participants
+        if student_count < 3:
+            logger.info(f"ℹ️ Room {room_id} waiting for 3 participants (current: {student_count})")
             return
 
-        logger.info(f"🎬 Starting story for room {room_id} with {student_count} students")
+        logger.info(f"🎬 Starting desert survival task for room {room_id} with {student_count} students")
 
         # Update room status
         update_room_status(room_id, 'active')
@@ -385,21 +474,21 @@ def start_story_for_room(room_id: str):
             room_id=room_id,
             mode=room['mode'],
             participant_count=student_count,
-            story_id=room['story_id']
+            story_id=room.get('story_id', 'desert_survival')
         )
         room_sessions[room_id] = session['id']
 
-        # Send story intro
-        story_data = get_room_story_data(room_id)
-        if story_data:
-            intro = get_story_intro(story_data)
-            logger.info(f"📖 Sending story intro to room {room_id}")
+        # Send task intro
+        task_data = get_room_task_data(room_id)
+        if task_data:
+            intro = get_story_intro(task_data)
+            logger.info(f"📋 Sending task intro to room {room_id}")
 
             add_message(
                 room_id=room_id,
                 username="Moderator",
                 message=intro,
-                message_type="story"
+                message_type="task"
             )
 
             socketio.emit(
@@ -408,18 +497,568 @@ def start_story_for_room(room_id: str):
                 room=room_id,
             )
 
-            # Start appropriate mode
+            # Start research timer
+            start_research_timer(room_id)
+
+            # Start appropriate moderator based on condition
             if room['mode'] == 'passive':
-                logger.info(f"🔄 Starting passive loop for room {room_id}")
-                start_passive_loop(room_id)
+                logger.info(f"🔴 Starting PASSIVE moderator for room {room_id}")
+                start_passive_moderator(room_id)
             else:  # active mode
-                logger.info(f"👁️ Starting silence monitor for room {room_id}")
-                start_silence_monitor(room_id)
+                logger.info(f"🟢 Starting ACTIVE moderator for room {room_id}")
+                start_active_moderator(room_id)
         else:
-            logger.error(f"❌ No story data found for room {room_id}")
+            logger.error(f"❌ No task data found for room {room_id}")
 
     except Exception as e:
-        logger.error(f"❌ Error starting story for room {room_id}: {e}", exc_info=True)
+        logger.error(f"❌ Error starting task for room {room_id}: {e}", exc_info=True)
+
+# ============================================================
+# ACTIVE MODERATOR - Complete Implementation
+# ============================================================
+def start_active_moderator(room_id: str):
+    """Active moderator with proactive guidance as per experiment design"""
+    
+    def monitor_loop():
+        logger.info(f"🟢 ACTIVE moderator started for room {room_id}")
+        
+        last_intervention_time = time.time()
+        last_dominance_check = time.time()
+        last_silence_check = time.time()
+        
+        # Track if we've already invited each participant
+        invited_users = set()
+        # Track last time we sent a dominance message for each user
+        last_dominance_message = {}
+        
+        while True:
+            try:
+                time.sleep(5)  # Check every 5 seconds
+                
+                room = get_room(room_id)
+                if not room or room.get('story_finished') or room['status'] == 'completed':
+                    logger.info(f"⏹️ Active moderator stopped for room {room_id}")
+                    break
+                
+                now = time.time()
+                
+                # Parse created_at timestamp safely
+                time_elapsed = 0
+                created_at_val = room.get('created_at')
+                
+                if created_at_val:
+                    try:
+                        if isinstance(created_at_val, str):
+                            created_at_val = created_at_val.replace('Z', '+00:00')
+                            created_at_dt = datetime.fromisoformat(created_at_val)
+                            time_elapsed = int((now - created_at_dt.timestamp()) / 60)
+                        elif isinstance(created_at_val, (int, float)):
+                            time_elapsed = int((now - float(created_at_val)) / 60)
+                    except:
+                        time_elapsed = 0
+                
+                time_elapsed = max(0, time_elapsed)
+                time_remaining = max(0, 15 - time_elapsed)
+                
+                # Get recent messages for analysis
+                messages = get_chat_history(room_id, limit=50)
+                
+                # Get actual participants (excluding Moderator)
+                all_participants = get_participants(room_id)
+                participant_names = [p['username'] for p in all_participants if p['username'] != 'Moderator']
+                
+                # If less than 3 participants, skip (shouldn't happen but just in case)
+                if len(participant_names) < 3:
+                    continue
+                
+                # ===== ACTIVE MODERATOR RULES =====
+                
+                # RULE 1: Check for dominance (>50% of recent messages)
+                if now - last_dominance_check > 30:  # Check every 30 seconds
+                    dominant_user = check_dominance(room_id)
+                    
+                    # Only trigger if:
+                    # 1. A dominant user is detected
+                    # 2. We haven't intervened in the last 60 seconds (cooldown)
+                    # 3. The dominant user is actually in the room
+                    # 4. We haven't sent a dominance message to this user in the last 2 minutes
+                    if (dominant_user and 
+                        dominant_user in participant_names and 
+                        (now - last_intervention_time > 60) and
+                        (dominant_user not in last_dominance_message or now - last_dominance_message.get(dominant_user, 0) > 120)):
+                        
+                        logger.info(f"👑 Dominance detected: {dominant_user}")
+                        
+                        # Get other participants (excluding the dominant one)
+                        others = [p for p in participant_names if p != dominant_user]
+                        
+                        # Use LLM to generate a balanced response
+                        if len(others) >= 1:
+                            # Let the LLM generate a natural response
+                            response = generate_active_moderator_response(
+                                participants=participant_names,
+                                chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
+                                task_context="Desert survival ranking",
+                                time_elapsed=time_elapsed,
+                                last_intervention_time=int(now - last_intervention_time),
+                                dominance_detected=dominant_user,
+                                silent_user=None
+                            )
+                            
+                            # If LLM fails, use fallback
+                            if not response or len(response) < 10:
+                                if len(others) >= 2:
+                                    response = f"{dominant_user}, thanks for your input. Let's also hear from {others[0]} and {others[1]} - what are your thoughts on the item ranking?"
+                                else:
+                                    response = f"{dominant_user}, good points. {others[0]}, what do you think about this?"
+                            
+                            add_message(room_id, "Moderator", response, "moderator")
+                            socketio.emit("receive_message", 
+                                        {"sender": "Moderator", "message": response},
+                                        room=room_id)
+                            
+                            # Log intervention for research
+                            log_moderator_intervention(room_id, "balance_dominance", dominant_user)
+                            last_intervention_time = now
+                            last_dominance_message[dominant_user] = now
+                            
+                            logger.info(f"✅ Sent dominance balance message for {dominant_user}")
+                    
+                    last_dominance_check = now
+                
+                # RULE 2: Check for silence (3 minutes) - invite quieter members
+                if now - last_silence_check > 30:  # Check every 30 seconds
+                    silent_user = check_silence(room_id)
+                    
+                    # Only trigger if:
+                    # 1. A silent user is detected
+                    # 2. We haven't intervened in the last 60 seconds (cooldown)
+                    # 3. The silent user hasn't been invited recently
+                    if (silent_user and 
+                        silent_user in participant_names and 
+                        (now - last_intervention_time > 60) and
+                        silent_user not in invited_users):
+                        
+                        logger.info(f"🤫 Silence detected: {silent_user}")
+                        
+                        # Use LLM to generate an invitation
+                        response = generate_active_moderator_response(
+                            participants=participant_names,
+                            chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
+                            task_context="Desert survival ranking",
+                            time_elapsed=time_elapsed,
+                            last_intervention_time=int(now - last_intervention_time),
+                            dominance_detected=None,
+                            silent_user=silent_user
+                        )
+                        
+                        # Fallback if LLM fails
+                        if not response or len(response) < 10:
+                            response = f"{silent_user}, we haven't heard from you yet. What do you think about the desert survival items? Which one would you prioritize?"
+                        
+                        add_message(room_id, "Moderator", response, "moderator")
+                        socketio.emit("receive_message",
+                                    {"sender": "Moderator", "message": response},
+                                    room=room_id)
+                        
+                        log_moderator_intervention(room_id, "invite_silent", silent_user)
+                        invited_users.add(silent_user)
+                        last_intervention_time = now
+                        
+                        logger.info(f"✅ Sent invitation to {silent_user}")
+                    
+                    last_silence_check = now
+                
+                # RULE 3: Time-based prompts (last 5 minutes)
+                if time_remaining <= 5 and time_remaining > 4 and now - last_intervention_time > 60:
+                    # Use LLM for time warning
+                    response = generate_active_moderator_response(
+                        participants=participant_names,
+                        chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
+                        task_context="Desert survival ranking",
+                        time_elapsed=time_elapsed,
+                        last_intervention_time=int(now - last_intervention_time),
+                        dominance_detected=None,
+                        silent_user=None
+                    )
+                    
+                    # Fallback
+                    if not response or len(response) < 10:
+                        response = f"⚠️ We have {time_remaining} minutes remaining. Can you agree on your top 3 most important items?"
+                    
+                    add_message(room_id, "Moderator", response, "moderator")
+                    socketio.emit("receive_message",
+                                {"sender": "Moderator", "message": response},
+                                room=room_id)
+                    
+                    log_moderator_intervention(room_id, "time_warning", None)
+                    last_intervention_time = now
+                    logger.info(f"✅ Sent time warning: {time_remaining} minutes remaining")
+                
+                # RULE 4: Answer questions about the task
+                if messages and len(messages) > 0:
+                    last_msg = messages[-1]
+                    if last_msg.get('username') != 'Moderator':
+                        msg_content = last_msg.get('message', '').lower()
+                        
+                        # Check if it's a question (contains ? or question words)
+                        is_question = False
+                        if '?' in msg_content:
+                            is_question = True
+                        else:
+                            question_words = ['what', 'how', 'why', 'when', 'where', 'which', 'who', 
+                                             'explain', 'help', 'confused', 'not sure', 'do we', 'should we',
+                                             'can you', 'could you', 'would you', 'tell me']
+                            for word in question_words:
+                                if word in msg_content:
+                                    is_question = True
+                                    break
+                        
+                        # Also check for question phrases
+                        question_phrases = ['what to do', 'what next', 'how to', 'what is', 'what are',
+                                           'what should', 'how do', 'can you help', 'need help']
+                        for phrase in question_phrases:
+                            if phrase in msg_content:
+                                is_question = True
+                                break
+                        
+                        if is_question and (now - last_intervention_time > 30):
+                            logger.info(f"❓ Question detected from {last_msg.get('username')}: {msg_content[:100]}...")
+                            
+                            # Generate response using LLM
+                            response = generate_active_moderator_response(
+                                participants=participant_names,
+                                chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
+                                task_context="Desert survival ranking",
+                                time_elapsed=time_elapsed,
+                                last_intervention_time=int(now - last_intervention_time),
+                                dominance_detected=None,
+                                silent_user=None
+                            )
+                            
+                            # Only send if we got a valid response (not fallback)
+                            if response and len(response) > 10 and "Thanks for sharing" not in response:
+                                add_message(room_id, "Moderator", response, "moderator")
+                                socketio.emit("receive_message", 
+                                            {"sender": "Moderator", "message": response},
+                                            room=room_id)
+                                
+                                log_moderator_intervention(room_id, "answered_question", last_msg.get('username'))
+                                last_intervention_time = now
+                                logger.info(f"✅ Answered question from {last_msg.get('username')}: {response[:100]}...")
+                            else:
+                                # Fallback answer based on question type
+                                fallback = "Your task is to rank the 12 desert survival items from most important (1) to least important (12). Discuss with your group and agree on a final ranking. You have 15 minutes total."
+                                
+                                # Customize fallback based on question content
+                                if 'time' in msg_content or 'minute' in msg_content:
+                                    fallback = f"You have about {time_remaining} minutes remaining to complete the ranking task."
+                                elif 'item' in msg_content or 'rank' in msg_content:
+                                    fallback = "You need to rank the 12 items from most important (1) to least important (12) for desert survival. Discuss with your group and reach consensus."
+                                
+                                add_message(room_id, "Moderator", fallback, "moderator")
+                                socketio.emit("receive_message", 
+                                            {"sender": "Moderator", "message": fallback},
+                                            room=room_id)
+                                
+                                log_moderator_intervention(room_id, "answered_question_fallback", last_msg.get('username'))
+                                last_intervention_time = now
+                                logger.info(f"✅ Sent fallback answer to {last_msg.get('username')}")
+                
+                # RULE 5: Periodic summaries (every 5 minutes)
+                if time_elapsed > 0 and time_elapsed % 5 == 0 and now - last_intervention_time > 60:
+                    # Use LLM for summary
+                    response = generate_active_moderator_response(
+                        participants=participant_names,
+                        chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
+                        task_context="Desert survival ranking",
+                        time_elapsed=time_elapsed,
+                        last_intervention_time=int(now - last_intervention_time),
+                        dominance_detected=None,
+                        silent_user=None
+                    )
+                    
+                    # Fallback
+                    if not response or len(response) < 10:
+                        msg_count = len([m for m in messages if m.get('username') != 'Moderator'])
+                        response = f"📊 {time_elapsed} minutes have passed. You've sent {msg_count} messages. Keep discussing to reach consensus on the item ranking."
+                    
+                    add_message(room_id, "Moderator", response, "moderator")
+                    socketio.emit("receive_message",
+                                {"sender": "Moderator", "message": response},
+                                room=room_id)
+                    
+                    log_moderator_intervention(room_id, "summary", None)
+                    last_intervention_time = now
+                    logger.info(f"✅ Sent summary at {time_elapsed} minutes")
+                
+            except Exception as e:
+                logger.error(f"❌ Error in active moderator loop: {e}")
+                logger.error(traceback.format_exc())
+                time.sleep(5)
+    
+    thread = threading.Thread(target=monitor_loop, daemon=True)
+    thread.start()
+    active_monitors[room_id] = thread
+    logger.info(f"✅ ACTIVE moderator thread started for room {room_id}")
+    return thread
+
+# ============================================================
+# PASSIVE MODERATOR - FIXED VERSION
+# ============================================================
+def start_passive_moderator(room_id: str):
+    """Passive moderator - only responds when asked, minimal interventions"""
+    
+    def monitor_loop():
+        logger.info(f"🔴 PASSIVE moderator started for room {room_id}")
+        
+        last_response_time = time.time()
+        
+        while True:
+            try:
+                time.sleep(3)  # Check frequently for messages directed at moderator
+                
+                room = get_room(room_id)
+                if not room or room.get('story_finished') or room['status'] == 'completed':
+                    logger.info(f"⏹️ Passive moderator stopped for room {room_id}")
+                    break
+                
+                now = time.time()
+                
+                # ===== SAFE TIME CALCULATION =====
+                time_elapsed = 0
+                created_at_val = room.get('created_at')
+                
+                if created_at_val:
+                    try:
+                        if isinstance(created_at_val, str):
+                            created_at_val = created_at_val.replace('Z', '+00:00')
+                            created_at_dt = datetime.fromisoformat(created_at_val)
+                            time_elapsed = int((now - created_at_dt.timestamp()) / 60)
+                        elif isinstance(created_at_val, (int, float)):
+                            time_elapsed = int((now - float(created_at_val)) / 60)
+                    except Exception as e:
+                        logger.warning(f"Could not parse created_at: {e}")
+                        time_elapsed = 0
+                
+                time_elapsed = max(0, time_elapsed)
+                time_remaining = max(0, 15 - time_elapsed)
+                time_remaining_int = int(time_remaining)
+                
+                # Check if anyone asked the moderator
+                messages = get_chat_history(room_id, limit=10)
+                if messages and len(messages) > 0:
+                    last_msg = messages[-1]
+                    
+                    # Only respond if message is directed at moderator
+                    if last_msg.get('username') != 'Moderator':
+                        msg_text = last_msg.get('message', '').lower()
+                        full_msg = last_msg.get('message', '')
+                        
+                        # ===== FIXED: Better moderator detection =====
+                        asked_moderator = False
+                        
+                        # Check for @moderator (most explicit)
+                        if '@moderator' in msg_text:
+                            asked_moderator = True
+                            logger.info(f"   ✓ @moderator detected")
+                        
+                        # Check for "moderator" with question mark
+                        elif 'moderator' in msg_text and '?' in full_msg:
+                            asked_moderator = True
+                            logger.info(f"   ✓ 'moderator' with ? detected")
+                        
+                        # Check for common question phrases
+                        elif any(phrase in msg_text for phrase in [
+                            'what do you think', 'your opinion', 'help us', 
+                            'can you help', 'what should we', 'tell us'
+                        ]):
+                            asked_moderator = True
+                            logger.info(f"   ✓ question phrase detected")
+                        
+                        if asked_moderator and (now - last_response_time > 10):
+                            logger.info(f"🗣️ Moderator asked directly in room {room_id} by {last_msg.get('username')}")
+                            
+                            # Get actual participants
+                            all_participants = get_participants(room_id)
+                            participant_names = [p['username'] for p in all_participants if p['username'] != 'Moderator']
+                            
+                            # Generate passive response using the dedicated function
+                            response = generate_passive_moderator_response(
+                                participants=participant_names,
+                                chat_history=[{"sender": m['username'], "message": m['message']} for m in messages],
+                                last_user_message=full_msg,
+                                time_elapsed=time_elapsed
+                            )
+                            
+                            # Fallback if no response
+                            if not response:
+                                if 'time' in msg_text or 'minute' in msg_text:
+                                    response = f"You have about {time_remaining_int} minutes remaining."
+                                elif 'rank' in msg_text or 'item' in msg_text or 'task' in msg_text:
+                                    response = "You need to rank the 12 desert survival items from most important (1) to least important (12)."
+                                else:
+                                    response = "I'm observing the discussion. Continue with your task."
+                            
+                            add_message(room_id, "Moderator", response, "moderator")
+                            socketio.emit("receive_message",
+                                        {"sender": "Moderator", "message": response},
+                                        room=room_id)
+                            
+                            log_moderator_intervention(room_id, "responded_to_question", last_msg.get('username'))
+                            last_response_time = now
+                            logger.info(f"✅ Responded to question from {last_msg.get('username')}: {response[:100]}...")
+                
+                # ONLY time reminder near the end (5 minutes remaining) - same as active for fairness
+                if time_remaining_int == 5 and (now - last_response_time > 60):
+                    warning_msg = "⚠️ **5 minutes remaining!** Please work towards your final ranking."
+                    add_message(
+                        room_id=room_id,
+                        username="Moderator",
+                        message=warning_msg,
+                        message_type="system"
+                    )
+                    
+                    socketio.emit(
+                        "receive_message",
+                        {"sender": "Moderator", "message": warning_msg},
+                        room=room_id,
+                    )
+                    
+                    log_moderator_intervention(room_id, "time_warning", None)
+                    last_response_time = now
+                    logger.info(f"✅ Sent time warning at 5 minutes")
+                
+                time.sleep(5)
+                
+            except Exception as e:
+                logger.error(f"❌ Error in passive moderator loop: {e}")
+                logger.error(traceback.format_exc())
+                time.sleep(5)
+    
+    thread = threading.Thread(target=monitor_loop, daemon=True)
+    thread.start()
+    active_monitors[room_id] = thread
+    logger.info(f"✅ PASSIVE moderator thread started for room {room_id}")
+    return thread
+
+# ============================================================
+# Helper Functions for Research
+# ============================================================
+def check_dominance(room_id: str) -> Optional[str]:
+    """Check if any participant is dominating (>50% of recent messages)"""
+    messages = get_chat_history(room_id, limit=20)
+    
+    if len(messages) < 8:  # Need at least 8 messages to detect dominance
+        return None
+    
+    # Count messages in last 3 minutes
+    now = time.time()
+    cutoff = now - 180  # 3 minutes
+    
+    recent_counts = {}
+    for msg in messages:
+        if msg['username'] == 'Moderator':
+            continue
+        try:
+            msg_time = datetime.fromisoformat(msg['created_at'].replace('Z', '+00:00')).timestamp()
+            if msg_time > cutoff:
+                recent_counts[msg['username']] = recent_counts.get(msg['username'], 0) + 1
+        except:
+            continue
+    
+    if not recent_counts:
+        return None
+    
+    total = sum(recent_counts.values())
+    if total < 5:  # Need at least 5 messages in last 3 minutes
+        return None
+    
+    # Find if anyone has >50% AND has at least 3 messages
+    for user, count in recent_counts.items():
+        share = count / total
+        if share > DOMINANCE_THRESHOLD and count >= 3:
+            # Check if others have spoken - if only one person has spoken, that's not dominance, that's just low participation
+            if len(recent_counts) >= 2:  # At least 2 people have spoken
+                return user
+    return None
+
+def check_silence(room_id: str) -> Optional[str]:
+    """Check if anyone hasn't spoken in 3 minutes"""
+    participants = get_participants(room_id)
+    if len(participants) < 3:
+        return None
+    
+    messages = get_chat_history(room_id, limit=50)
+    
+    now = time.time()
+    cutoff = now - SILENCE_THRESHOLD_SECONDS  # 3 minutes
+    
+    recent_speakers = set()
+    for msg in messages:
+        if msg['username'] == 'Moderator':
+            continue
+        try:
+            msg_time = datetime.fromisoformat(msg['created_at'].replace('Z', '+00:00')).timestamp()
+            if msg_time > cutoff:
+                recent_speakers.add(msg['username'])
+        except:
+            continue
+    
+    # Find who hasn't spoken
+    for p in participants:
+        if p['username'] != 'Moderator' and p['username'] not in recent_speakers:
+            return p['username']
+    return None
+
+# ============================================================
+# Submit Ranking Endpoint
+# ============================================================
+@socketio.on("submit_ranking")
+def handle_submit_ranking(data):
+    """Handle final ranking submission from group"""
+    room_id = data.get("room_id")
+    ranking = data.get("ranking")  # List of items in ranked order
+    
+    logger.info(f"📊 Final ranking submitted for room {room_id}")
+    
+    try:
+        # Save to database
+        supabase.table("rooms").update({
+            "final_ranking": json.dumps(ranking),
+            "ranking_submitted_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", room_id).execute()
+        
+        # Compare with expert ranking
+        comparison = compare_with_expert_ranking(ranking)
+        logger.info(f"📈 Ranking accuracy: {comparison['accuracy_percentage']:.1f}%")
+        
+        # Save metrics
+        metrics = analyze_participation(room_id, get_chat_history(room_id))
+        if metrics:
+            supabase.table("research_metrics").insert({
+                "room_id": room_id,
+                "gini_coefficient": metrics['gini_coefficient'],
+                "max_share": metrics['max_share'],
+                "min_share": metrics['min_share'],
+                "dominance_gap": metrics['dominance_gap'],
+                "total_messages": metrics['total_messages'],
+                "ranking_accuracy": comparison['accuracy_percentage'],
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+        
+        # Send confirmation
+        socketio.emit("ranking_submitted", {
+            "success": True,
+            "message": "Ranking submitted successfully!"
+        }, room=room_id)
+        
+    except Exception as e:
+        logger.error(f"❌ Error saving ranking: {e}")
+        socketio.emit("ranking_submitted", {
+            "success": False,
+            "message": "Failed to submit ranking"
+        }, room=room_id)
 
 # ============================================================
 # Auto Room Assignment Endpoint
@@ -434,16 +1073,26 @@ def auto_join_room(mode: str):
         return jsonify({"error": "Invalid mode. Use 'active' or 'passive'"}), 400
 
     try:
-        # Get random story
-        story_data = get_data()
-        story_id = story_data.get('story_id', 'default-story')
-        logger.info(f"📚 Selected story: {story_id}")
+        # DEBUG: List all available rooms
+        try:
+            rooms_response = supabase.table("rooms").select("*").eq("mode", mode).in_("status", ["waiting", "active"]).execute()
+            rooms = rooms_response.data or []
+            logger.info(f"📋 Found {len(rooms)} rooms in '{mode}' mode:")
+            for room in rooms:
+                logger.info(f"   Room {room['id'][:8]}...: {room.get('participant_count', 0)}/3 participants, status={room['status']}")
+        except Exception as e:
+            logger.error(f"❌ Error listing rooms: {e}")
+
+        # Get desert survival task (always same)
+        task_data = get_data()
+        story_id = task_data.get('task_id', 'desert_survival')
+        logger.info(f"📚 Using task: {story_id}")
 
         # Get or create room
         room = get_or_create_room(mode=mode, story_id=story_id)
         room_id = room['id']
 
-        logger.info(f"✅ Room assigned: {room_id} (mode={mode}, participants={room.get('participant_count', 0)})")
+        logger.info(f"✅ Room assigned: {room_id} (mode={mode}, participants={room.get('participant_count', 0)}/3)")
 
         # Generate a proper username
         user_name = f"Student_{random.randint(1000, 9999)}"
@@ -451,8 +1100,8 @@ def auto_join_room(mode: str):
         # Return username in response
         redirect_url = f"{FRONTEND_URL}/chat/{room_id}?userName={user_name}"
 
-        # Auto-start story for single user
-        socketio.start_background_task(lambda: start_story_for_room(room_id))
+        # Auto-start task when room is ready
+        socketio.start_background_task(lambda: start_task_for_room(room_id))
 
         return jsonify({
             "room_id": room_id,
@@ -493,332 +1142,311 @@ def get_room_info(room_id: str):
         return jsonify({"error": "Failed to get room info"}), 500
 
 # ============================================================
-# Passive Story Continuation
+# Socket.IO Events
 # ============================================================
-def passive_continue_story(room_id: str):
-    """Continue story in passive mode"""
+@socketio.on("connect")
+def handle_connect():
+    logger.info(f"🔌 Client connected: {request.sid}")
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    logger.info(f"🔌 Client disconnected: {request.sid}")
+
+@socketio.on("create_room")
+def create_room_handler(data):
+    """Handle room creation"""
+    user = data.get("user_name", "Student")
+    mode = data.get("moderatorMode", "active")
+
+    logger.info(f"🏗️ Creating room: user={user}, mode={mode}, sid={request.sid}")
+
     try:
-        room = get_room(room_id)
-        if not room or room.get('story_finished') or room['mode'] != 'passive':
-            return
+        story_data = get_data()
+        story_id = story_data.get('story_id', 'default-story')
 
-        story_data = get_room_story_data(room_id)
-        if not story_data:
-            return
+        from supabase_client import create_room
+        room = create_room(mode=mode, story_id=story_id)
+        room_id = room['id']
 
-        sentences = story_data.get("sentences", [])
-        total = len(sentences)
+        logger.info(f"✅ Room created: {room_id}")
 
-        start = room.get('current_chunk_index', 0)
-        end = min(start + PASSIVE_STORY_STEP, total)
+        participant = add_participant(
+            room_id=room_id,
+            username=user,
+            socket_id=request.sid
+        )
+        logger.info(f"✅ Participant added: {user} → room {room_id}")
 
-        next_chunk = " ".join(sentences[start:end])
-        is_last = end >= total
-
-        logger.info(f"📖 Passive story chunk {start}→{end}/{total} for room {room_id}")
-
-        msg = generate_passive_chunk(next_chunk, is_last_chunk=is_last)
+        join_room(room_id)
 
         add_message(
             room_id=room_id,
             username="Moderator",
+            message=WELCOME_MESSAGE,
+            message_type="system"
+        )
+
+        emit("joined_room", {"room_id": room_id}, to=request.sid)
+        emit("room_created", {"room_id": room_id, "mode": mode}, to=request.sid)
+        emit(
+            "receive_message",
+            {"sender": "Moderator", "message": WELCOME_MESSAGE},
+            room=room_id,
+        )
+
+        socketio.start_background_task(lambda: start_task_for_room(room_id))
+
+    except Exception as e:
+        logger.error(f"❌ Error creating room: {e}", exc_info=True)
+        emit("error", {"message": "Failed to create room"})
+
+@socketio.on("join_room")
+def join_room_handler(data):
+    """Handle user joining existing room"""
+    room_id = data.get("room_id")
+    user_name = data.get("user_name")
+
+    logger.info(f"🚪 Join room request: room={room_id}, user={user_name}, sid={request.sid}")
+
+    try:
+        room = get_room(room_id)
+        if not room:
+            logger.warning(f"⚠️ Room not found: {room_id}")
+            emit("error", {"message": "Room not found"})
+            return
+
+        # Check if participant already exists in this room
+        existing_participant = get_participant_by_username(room_id, user_name)
+        if existing_participant:
+            logger.info(f"👤 Participant {user_name} already in room {room_id}, reconnecting")
+            # Update their socket ID
+            supabase.table('participants').update({
+                'socket_id': request.sid,
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }).eq('id', existing_participant['id']).execute()
+        else:
+            # Add new participant
+            participant = add_participant(
+                room_id=room_id,
+                username=user_name,
+                socket_id=request.sid,
+                display_name=user_name
+            )
+            logger.info(f"✅ New participant added: {user_name} → room {room_id}")
+
+        join_room(room_id)
+
+        # Get chat history
+        history = get_chat_history(room_id)
+        chat_history = [
+            {
+                "sender": msg['username'],
+                "message": msg['message'],
+                "timestamp": msg['created_at']
+            }
+            for msg in history
+        ]
+
+        # Get current participants (deduplicated)
+        participants = get_participants(room_id)
+        participant_names = list(set([p['username'] for p in participants if p.get('username')]))
+        
+        # Always include the current user
+        if user_name not in participant_names:
+            participant_names.append(user_name)
+
+        logger.info(f"📜 Sending {len(chat_history)} messages to {user_name}")
+        logger.info(f"👥 Current participants: {participant_names}")
+
+        emit("joined_room", {"room_id": room_id}, to=request.sid)
+        emit("chat_history", {
+            "chat_history": chat_history,
+            "participants": participant_names
+        }, to=request.sid)
+        
+        emit("participants_update", {
+            "participants": participant_names,
+            "new_user": user_name
+        }, room=room_id)
+
+        # Try to start task
+        socketio.start_background_task(lambda: start_task_for_room(room_id))
+
+    except Exception as e:
+        logger.error(f"❌ Error joining room: {e}", exc_info=True)
+        emit("error", {"message": "Failed to join room"})
+
+@socketio.on("send_message")
+def send_message_handler(data):
+    """Handle user message"""
+    room_id = data.get("room_id")
+    sender = data.get("sender")
+    msg = (data.get("message") or "").strip()
+
+    if not msg:
+        return
+
+    # Calculate word count
+    word_count = len(msg.split())
+    
+    logger.info(f"💬 Message from {sender} in room {room_id}: {msg[:50]}... (words: {word_count})")
+
+    try:
+        room = get_room(room_id)
+        if not room or room.get('story_finished'):
+            logger.warning(f"⚠️ Cannot send message - room {room_id} finished or not found")
+            return
+
+        add_message(
+            room_id=room_id,
+            username=sender,
             message=msg,
-            message_type="story",
-            metadata={"story_progress": end, "is_last": is_last}
+            message_type="chat",
+            metadata={"word_count": word_count}
         )
 
-        socketio.emit(
+        emit(
             "receive_message",
-            {"sender": "Moderator", "message": msg},
+            {"sender": sender, "message": msg, "timestamp": datetime.now().isoformat()},
             room=room_id,
         )
 
-        # Update progress
-        supabase.table("rooms").update({
-            "current_chunk_index": end
-        }).eq("id", room_id).execute()
-
-        if is_last:
-            logger.info(f"🏁 Story finished for room {room_id}")
-            ending = get_random_ending()
-
-            add_message(
-                room_id=room_id,
-                username="Moderator",
-                message=ending,
-                message_type="system"
-            )
-
-            socketio.emit(
-                "receive_message",
-                {"sender": "Moderator", "message": ending},
-                room=room_id,
-            )
-
-            end_session(room_id)
-            update_room_status(room_id, "completed")
+        logger.info(f"✅ Message sent to room {room_id}")
 
     except Exception as e:
-        logger.error(f"❌ Error in passive_continue_story: {e}", exc_info=True)
-
-def start_passive_loop(room_id: str):
-    """Start background task for passive story advancement"""
-    def loop():
-        logger.info(f"🔄 Passive loop started for room {room_id}")
-        while True:
-            room = get_room(room_id)
-            if not room or room.get('story_finished') or room['status'] == 'completed':
-                logger.info(f"⏹️ Passive loop stopped for room {room_id}")
-                break
-
-            passive_continue_story(room_id)
-            socketio.sleep(STORY_CHUNK_INTERVAL)
-
-    socketio.start_background_task(loop)
+        logger.error(f"❌ Error sending message: {e}", exc_info=True)
 
 # ============================================================
-# Active Story Advancement
-# ============================================================
-def advance_story_chunk(room_id: str):
-    """Advance story in active mode"""
-    try:
-        room = get_room(room_id)
-        if not room or room.get('story_finished'):
-            return
-
-        story_data = get_room_story_data(room_id)
-        if not story_data:
-            return
-
-        sentences = story_data.get("sentences", [])
-        total = len(sentences)
-
-        start = room.get('current_chunk_index', 0)
-        end = min(start + ACTIVE_STORY_STEP, total)
-        is_last = end >= total
-
-        logger.info(f"📖 Active story chunk {start}→{end}/{total} for room {room_id}")
-
-        context = " ".join(sentences[:end])
-
-        participants = get_participants(room_id)
-        student_names = [p['username'] for p in participants]
-
-        history = get_chat_history(room_id)
-        chat_history = [
-            {"sender": msg['username'], "message": msg['message']}
-            for msg in history
-        ]
-
-        reply = generate_moderator_reply(
-            student_names,
-            chat_history,
-            context,
-            start,
-            is_last_chunk=is_last,
-        )
-
-        add_message(
-            room_id=room_id,
-            username="Moderator",
-            message=reply,
-            message_type="moderator",
-            metadata={"story_progress": end, "is_last": is_last}
-        )
-
-        socketio.emit(
-            "receive_message",
-            {"sender": "Moderator", "message": reply},
-            room=room_id,
-        )
-
-        # Update progress
-        supabase.table("rooms").update({
-            "current_chunk_index": end
-        }).eq("id", room_id).execute()
-
-        if is_last:
-            logger.info(f"🏁 Story finished for room {room_id}")
-            ending_message = os.getenv("ACTIVE_ENDING_MESSAGE", "✨ We have reached the end of the story.")
-            
-            add_message(
-                room_id=room_id,
-                username="Moderator",
-                message=ending_message,
-                message_type="system"
-            )
-
-            socketio.emit(
-                "receive_message",
-                {"sender": "Moderator", "message": ending_message},
-                room=room_id,
-            )
-
-            end_session(room_id)
-            update_room_status(room_id, "completed")
-
-    except Exception as e:
-        logger.error(f"❌ Error in advance_story_chunk: {e}", exc_info=True)
-
-# ============================================================
-# Engagement Response (without advancing story)
-# ============================================================
-def send_engagement_response(room_id: str):
-    """Send an engagement response (question/discussion) without advancing story"""
-    try:
-        room = get_room(room_id)
-        if not room or room.get('story_finished'):
-            return
-
-        story_data = get_room_story_data(room_id)
-        if not story_data:
-            return
-
-        sentences = story_data.get("sentences", [])
-        current_progress = room.get('current_chunk_index', 0)
-
-        context = " ".join(sentences[:current_progress])
-
-        participants = get_participants(room_id)
-        student_names = [p['username'] for p in participants]
-
-        history = get_chat_history(room_id)
-        chat_history = [
-            {"sender": msg['username'], "message": msg['message']}
-            for msg in history
-        ]
-
-        response = generate_engagement_response(
-            student_names,
-            chat_history,
-            context,
-            current_progress
-        )
-
-        logger.info(f"💭 Engagement response for room {room_id}: {response[:50]}...")
-
-        add_message(
-            room_id=room_id,
-            username="Moderator",
-            message=response,
-            message_type="moderator",
-            metadata={"type": "engagement", "story_progress": current_progress}
-        )
-
-        socketio.emit(
-            "receive_message",
-            {"sender": "Moderator", "message": response},
-            room=room_id,
-        )
-
-    except Exception as e:
-        logger.error(f"❌ Error in send_engagement_response: {e}", exc_info=True)
-
-# ============================================================
-# Silence Monitor (Active Mode)
-# ============================================================
-def start_silence_monitor(room_id: str):
-    """Monitor silence and trigger intelligent interventions in active mode"""
-    def loop():
-        logger.info(f"👁️ Silence monitor started for room {room_id}")
-        last_intervention = time.time()
-        last_story_advance = time.time()
-
-        while True:
-            time.sleep(5)
-
-            room = get_room(room_id)
-            if not room or room.get('story_finished') or room['status'] == 'completed':
-                logger.info(f"⏹️ Silence monitor stopped for room {room_id}")
-                break
-
-            now = time.time()
-            time_since_intervention = now - last_intervention
-            time_since_advance = now - last_story_advance
-
-            if time_since_intervention >= ACTIVE_INTERVENTION_WINDOW_SECONDS:
-                logger.info(f"🔔 Silence detected in room {room_id} ({time_since_intervention:.0f}s)")
-
-                history = get_chat_history(room_id)
-                chat_history = [
-                    {"sender": msg['username'], "message": msg['message']}
-                    for msg in history
-                ]
-
-                story_data = get_room_story_data(room_id)
-                if story_data:
-                    sentences = story_data.get("sentences", [])
-                    current_progress = room.get('current_chunk_index', 0)
-                    context = " ".join(sentences[:current_progress])
-
-                    should_advance = should_advance_story(
-                        chat_history,
-                        context,
-                        int(time_since_advance)
-                    )
-
-                    if should_advance:
-                        logger.info(f"📖 AI Decision: ADVANCE story in room {room_id}")
-                        advance_story_chunk(room_id)
-                        last_story_advance = now
-                    else:
-                        logger.info(f"💬 AI Decision: ENGAGE students in room {room_id}")
-                        send_engagement_response(room_id)
-
-                last_intervention = now
-
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
-    active_monitors[room_id] = thread
-
-# ============================================================
-# ✅ FIXED: End Session with Guaranteed Feedback Delivery
+# End Session Handler
 # ============================================================
 @socketio.on("end_session")
 def handle_end_session(data):
-    """End session and send personalized feedback to each participant - FIXED VERSION"""
+    """End session, calculate research metrics, and send personalized feedback"""
     room_id = data.get("room_id")
     sender = data.get("sender", "user")
     
     logger.info(f"🏁 Ending session for room {room_id} initiated by {sender}")
     
     try:
-        # Get room info
+        # ===== 1. GET ROOM INFO =====
         room = get_room(room_id)
         if not room:
             emit("error", {"message": "Room not found"})
             return
         
-        # Get story info for progress calculation
-        story_data = get_room_story_data(room_id)
+        # Get story info
+        story_data = get_room_task_data(room_id)
+        progress_percent = 100  # For desert survival, always 100% at end
         
-        # Calculate story progress percentage
-        progress_percent = 50  # Default
-        if story_data and room:
-            sentences = story_data.get('sentences', [])
-            total_sentences = len(sentences)
-            current_progress = room.get('current_chunk_index', 0)
-            if total_sentences > 0:
-                progress_percent = int((current_progress / total_sentences) * 100)
-        
-        # Get all participants
+        # ===== 2. GET ALL DATA =====
         participants = get_participants(room_id)
-        
-        # Get full chat history for feedback generation
         full_chat_history = get_chat_history(room_id)
+        
+        # Filter out moderator messages for participant analysis
+        participant_messages = [m for m in full_chat_history if m.get('username') != 'Moderator']
+        
+        # ===== 3. CALCULATE RESEARCH METRICS =====
+        
+        # Message counts per participant
+        message_counts = {}
+        word_counts = {}
+        for msg in participant_messages:
+            username = msg.get('username')
+            message_counts[username] = message_counts.get(username, 0) + 1
+            word_count = len(msg.get('message', '').split())
+            word_counts[username] = word_counts.get(username, 0) + word_count
+        
+        # Calculate total messages and shares
+        total_messages = sum(message_counts.values())
+        total_words = sum(word_counts.values())
+        
+        # Calculate speaking shares
+        speaking_shares = {}
+        if total_messages > 0:
+            for user, count in message_counts.items():
+                speaking_shares[user] = count / total_messages
+        
+        # Calculate Gini coefficient
+        gini_coefficient = 0
+        if len(message_counts) >= 3:  # Need at least 3 participants
+            shares = list(speaking_shares.values())
+            sorted_shares = sorted(shares)
+            n = len(sorted_shares)
+            cumulative = 0
+            gini = 0
+            for i, share in enumerate(sorted_shares):
+                cumulative += share
+                gini += (2*i - n + 1) * share
+            if sum(sorted_shares) > 0:
+                gini_coefficient = gini / (n * sum(sorted_shares))
+            gini_coefficient = max(0, min(gini_coefficient, 1))
+        
+        # Calculate dominance metrics
+        max_share = max(speaking_shares.values()) if speaking_shares else 0
+        min_share = min(speaking_shares.values()) if speaking_shares else 0
+        dominance_gap = max_share - min_share
+        
+        # Calculate time to consensus (if ranking was submitted)
+        time_to_consensus = None
+        if room.get('ranking_submitted_at') and room.get('created_at'):
+            try:
+                start_time = datetime.fromisoformat(room['created_at'].replace('Z', '+00:00'))
+                end_time = datetime.fromisoformat(room['ranking_submitted_at'].replace('Z', '+00:00'))
+                time_to_consensus = int((end_time - start_time).total_seconds())
+            except:
+                time_to_consensus = None
+        
+        # ===== 4. SAVE RESEARCH METRICS TO DATABASE =====
+        try:
+            # Save room-level metrics
+            metrics_data = {
+                "room_id": room_id,
+                "gini_coefficient": gini_coefficient,
+                "max_share": max_share,
+                "min_share": min_share,
+                "dominance_gap": dominance_gap,
+                "total_messages": total_messages,
+                "total_words": total_words,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Add ranking accuracy if available
+            if room.get('final_ranking'):
+                from data_retriever import compare_with_expert_ranking
+                ranking = json.loads(room.get('final_ranking'))
+                comparison = compare_with_expert_ranking(ranking)
+                metrics_data["ranking_accuracy"] = comparison['accuracy_percentage']
+            
+            # Add time to consensus if available
+            if time_to_consensus:
+                metrics_data["time_to_consensus"] = time_to_consensus
+            
+            supabase.table("research_metrics").insert(metrics_data).execute()
+            logger.info(f"📊 Saved research metrics for room {room_id}")
+            
+            # Save individual participant metrics
+            for user in message_counts.keys():
+                participant_data = {
+                    "room_id": room_id,
+                    "username": user,
+                    "message_count": message_counts.get(user, 0),
+                    "word_count": word_counts.get(user, 0),
+                    "share_of_talk": speaking_shares.get(user, 0),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
+                supabase.table("participant_metrics").insert(participant_data).execute()
+            
+            logger.info(f"👥 Saved participant metrics for {len(message_counts)} users")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to save research metrics: {e}")
+        
+        # ===== 5. GENERATE PERSONALIZED FEEDBACK =====
         chat_history_list = [
             {"sender": msg['username'], "message": msg['message']}
             for msg in full_chat_history
         ]
         
-        # Get story context
-        story_context = ""
-        if story_data and room:
-            sentences = story_data.get("sentences", [])
-            current_progress = room.get('current_chunk_index', 0)
-            story_context = " ".join(sentences[:current_progress])
-        
-        # Generate personalized feedback for EACH participant
         feedbacks = {}
         
         for participant in participants:
@@ -829,29 +1457,31 @@ def handle_end_session(data):
             if username == 'Moderator' or username == 'System':
                 continue
             
-            # Analyze this student's behavior
-            behavior_data = analyze_student_behavior(room_id, username)
+            # Get this participant's metrics
+            message_count = message_counts.get(username, 0)
+            word_count = word_counts.get(username, 0)
+            share_of_talk = speaking_shares.get(username, 0)
             
-            # Generate personalized feedback using LLM
+            logger.info(f"📝 Generating feedback for {username} ({message_count} messages, {share_of_talk:.1%} share)")
+            
+            # Generate personalized feedback
             feedback = generate_personalized_feedback(
                 student_name=display_name,
-                message_count=behavior_data['message_count'],
-                response_times=behavior_data['response_times'],
+                message_count=message_count,
+                response_times=[],
                 story_progress=progress_percent,
-                hint_responses=behavior_data['hint_responses'],
-                behavior_type=behavior_data['behavior_type'],
-                toxic_count=behavior_data['toxic_count'],
-                off_topic_count=behavior_data['off_topic_count'],
+                hint_responses=0,
+                behavior_type="moderate",
+                toxic_count=0,
+                off_topic_count=0,
                 chat_history=chat_history_list,
-                story_context=story_context
+                story_context=task_context
             )
             
             feedbacks[username] = feedback
             
-            # === THREE DELIVERY METHODS FOR GUARANTEED FEEDBACK ===
-            feedback_sent = False
-            
-            # METHOD 1: Try direct socket delivery (if participant still connected)
+            # METHOD 1: Direct socket delivery (most reliable)
+            delivery_success = False
             try:
                 participant_record = get_participant_by_username(room_id, username)
                 if participant_record and participant_record.get('socket_id'):
@@ -860,17 +1490,22 @@ def handle_end_session(data):
                         {
                             "feedback": feedback, 
                             "room_id": room_id,
-                            "username": username
+                            "username": username,
+                            "stats": {
+                                "message_count": message_count,
+                                "word_count": word_count,
+                                "share_of_talk": round(share_of_talk * 100, 1)
+                            }
                         },
                         room=participant_record['socket_id']
                     )
-                    logger.info(f"📨 Method 1: Sent direct feedback to {username} via socket {participant_record['socket_id']}")
-                    feedback_sent = True
+                    logger.info(f"📨 Sent direct feedback to {username}")
+                    delivery_success = True
             except Exception as e:
-                logger.warning(f"⚠️ Method 1 failed for {username}: {e}")
+                logger.warning(f"⚠️ Failed to send direct feedback to {username}: {e}")
             
-            # METHOD 2: Broadcast to entire room (client will filter by username)
-            if not feedback_sent:
+            # METHOD 2: Broadcast to room as backup (if direct failed)
+            if not delivery_success:
                 try:
                     socketio.emit(
                         "session_ended",
@@ -878,91 +1513,58 @@ def handle_end_session(data):
                             "feedback": feedback, 
                             "room_id": room_id,
                             "username": username,
+                            "stats": {
+                                "message_count": message_count,
+                                "word_count": word_count,
+                                "share_of_talk": round(share_of_talk * 100, 1)
+                            },
                             "broadcast": True
                         },
                         room=room_id
                     )
-                    logger.info(f"📨 Method 2: Broadcast feedback to room for {username}")
-                    feedback_sent = True
+                    logger.info(f"📢 Broadcast feedback for {username} as fallback")
                 except Exception as e:
-                    logger.warning(f"⚠️ Method 2 failed for {username}: {e}")
-            
-            # METHOD 3: Store in database for retrieval on next page load
-            try:
-                # Store feedback in a new table
-                supabase.table('session_feedback').upsert({
-                    'room_id': room_id,
-                    'username': username,
-                    'feedback': feedback,
-                    'created_at': datetime.now().isoformat()
-                }).execute()
-                logger.info(f"📨 Method 3: Stored feedback in database for {username}")
-            except Exception as e:
-                logger.error(f"❌ Method 3 failed for {username}: {e}")
+                    logger.error(f"❌ Failed to broadcast feedback for {username}: {e}")
         
-        # Log summary of feedback types
-        feedback_summary = {}
-        for username, feedback in feedbacks.items():
-            if "dismissive" in feedback.lower() or "harsh" in feedback.lower():
-                fb_type = "toxic"
-            elif "off-topic" in feedback.lower() or "creative" in feedback.lower():
-                fb_type = "off_topic"
-            elif "quiet" in feedback.lower() or "passive" in feedback.lower():
-                fb_type = "passive"
-            elif "model participant" in feedback.lower() or "excellent" in feedback.lower():
-                fb_type = "constructive"
-            else:
-                fb_type = "moderate"
-            
-            feedback_summary[fb_type] = feedback_summary.get(fb_type, 0) + 1
+        logger.info(f"📊 Feedback generated for {len(feedbacks)} participants")
         
-        logger.info(f"📊 Feedback summary for room {room_id}: {feedback_summary}")
+        # ===== 6. END SESSION IN DATABASE =====
+        try:
+            end_session(room_id, ended_by=sender, end_reason='user_ended')
+            logger.info(f"✅ Session ended in database for room {room_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to end session in database: {e}")
         
-        # End the session in database
-        end_session(room_id, ended_by=sender, end_reason='user_ended')
+        # ===== 7. UPDATE ROOM STATUS =====
+        try:
+            update_room_status(room_id, 'completed')
+            logger.info(f"✅ Room {room_id} marked as completed")
+        except Exception as e:
+            logger.error(f"❌ Failed to update room status: {e}")
         
-        # Update room status
-        update_room_status(room_id, 'completed')
-        
-        # Stop any running monitors
+        # ===== 8. STOP MONITORING THREADS =====
         if room_id in active_monitors:
-            del active_monitors[room_id]
+            try:
+                del active_monitors[room_id]
+                logger.info(f"🛑 Removed active monitor for room {room_id}")
+            except:
+                pass
         
-        logger.info(f"✅ Session ended for room {room_id}, feedback generated for {len(feedbacks)} participants")
+        if room_id in research_timers:
+            try:
+                del research_timers[room_id]
+                logger.info(f"🛑 Removed research timer for room {room_id}")
+            except:
+                pass
+        
+        logger.info(f"✅ Session fully ended for room {room_id}")
         
     except Exception as e:
-        logger.error(f"❌ Error ending session: {e}", exc_info=True)
-        emit("error", {"message": "Failed to end session"})
-
-# ============================================================
-# ✅ NEW: Get Stored Feedback Endpoint
-# ============================================================
-@app.route("/api/feedback/<room_id>/<username>", methods=["GET"])
-def get_stored_feedback(room_id: str, username: str):
-    """Retrieve stored feedback for a user"""
-    try:
-        response = supabase.table('session_feedback')\
-            .select('feedback')\
-            .eq('room_id', room_id)\
-            .eq('username', username)\
-            .order('created_at', desc=True)\
-            .limit(1)\
-            .execute()
-        
-        if response.data and len(response.data) > 0:
-            return jsonify({
-                "success": True,
-                "feedback": response.data[0]['feedback']
-            })
-        else:
-            return jsonify({
-                "success": False,
-                "feedback": None
-            }), 404
-            
-    except Exception as e:
-        logger.error(f"❌ Error retrieving feedback: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"❌ CRITICAL ERROR ending session: {e}", exc_info=True)
+        try:
+            emit("error", {"message": "Failed to end session properly"})
+        except:
+            pass
 
 # ============================================================
 # Admin Room Creation Endpoint
@@ -1032,61 +1634,32 @@ def admin_end_session(room_id: str):
     """Admin endpoint to end a session"""
     try:
         data = request.json or {}
-        end_type = data.get('type', 'session')
-        admin_note = data.get('admin_note', '')
+        admin_user = data.get('admin_user', 'admin')
         
         room = get_room(room_id)
         if not room:
             return jsonify({"error": "Room not found"}), 404
         
-        if end_type == 'story':
-            supabase.table('rooms').update({
-                'story_finished': True,
-                'admin_note': admin_note
-            }).eq('id', room_id).execute()
-            
-            story_end_msg = "📖 The story has reached its conclusion. You may continue discussing."
-            add_message(
-                room_id=room_id,
-                username="Moderator",
-                message=story_end_msg,
-                message_type="system"
-            )
-            
-            socketio.emit(
-                "receive_message",
-                {"sender": "Moderator", "message": story_end_msg},
-                room=room_id,
-            )
-            
-            action = 'end_story'
-            
-        else:
-            # Trigger the socket event to end session with summaries
-            socketio.emit("end_session", {
-                "room_id": room_id,
-                "sender": f"admin:{data.get('admin_user', 'admin')}"
-            }, room=room_id)
-            
-            action = 'end_session'
+        # Trigger the socket event to end session with summaries
+        socketio.emit("end_session", {
+            "room_id": room_id,
+            "sender": f"admin:{admin_user}"
+        }, room=room_id)
         
-        log_admin_action(action, 'room', room_id, {
-            'end_type': end_type,
-            'admin_note': admin_note,
-            'previous_status': room.get('status'),
-            'story_finished': room.get('story_finished')
-        }, data.get('admin_user', 'admin'))
+        log_admin_action('end_session', 'room', room_id, {
+            'previous_status': room.get('status')
+        }, admin_user)
         
-        logger.info(f"✅ Admin {action} for room {room_id}")
+        logger.info(f"✅ Admin triggered session end for room {room_id}")
         
         return jsonify({
             "success": True,
-            "message": f"{end_type.capitalize()} ended successfully",
+            "message": "Session ending, summaries will be sent to participants",
             "room_id": room_id
         })
     
     except Exception as e:
-        logger.error(f"❌ Error ending {end_type}: {e}", exc_info=True)
+        logger.error(f"❌ Error ending session: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
@@ -1108,177 +1681,6 @@ def log_admin_action(action: str, entity_type: str = None, entity_id: str = None
         logger.info(f"📝 Admin action logged: {action} by {admin_user}")
     except Exception as e:
         logger.error(f"❌ Failed to log admin action: {e}")
-
-# ============================================================
-# Socket.IO Events
-# ============================================================
-@socketio.on("connect")
-def handle_connect():
-    logger.info(f"🔌 Client connected: {request.sid}")
-
-@socketio.on("disconnect")
-def handle_disconnect():
-    logger.info(f"🔌 Client disconnected: {request.sid}")
-
-@socketio.on("create_room")
-def create_room_handler(data):
-    """Handle room creation"""
-    user = data.get("user_name", "Student")
-    mode = data.get("moderatorMode", "active")
-
-    logger.info(f"🏗️ Creating room: user={user}, mode={mode}, sid={request.sid}")
-
-    try:
-        story_data = get_data()
-        story_id = story_data.get('story_id', 'default-story')
-
-        from supabase_client import create_room
-        room = create_room(mode=mode, story_id=story_id)
-        room_id = room['id']
-
-        logger.info(f"✅ Room created: {room_id}")
-
-        participant = add_participant(
-            room_id=room_id,
-            username=user,
-            socket_id=request.sid
-        )
-        logger.info(f"✅ Participant added: {user} → room {room_id}")
-
-        join_room(room_id)
-
-        add_message(
-            room_id=room_id,
-            username="Moderator",
-            message=WELCOME_MESSAGE,
-            message_type="system"
-        )
-
-        emit("joined_room", {"room_id": room_id}, to=request.sid)
-        emit("room_created", {"room_id": room_id, "mode": mode}, to=request.sid)
-        emit(
-            "receive_message",
-            {"sender": "Moderator", "message": WELCOME_MESSAGE},
-            room=room_id,
-        )
-
-        socketio.start_background_task(lambda: start_story_for_room(room_id))
-
-    except Exception as e:
-        logger.error(f"❌ Error creating room: {e}", exc_info=True)
-        emit("error", {"message": "Failed to create room"})
-
-@socketio.on("join_room")
-def join_room_handler(data):
-    """Handle user joining existing room - FIXED VERSION"""
-    room_id = data.get("room_id")
-    user_name = data.get("user_name")
-
-    logger.info(f"🚪 Join room request: room={room_id}, user={user_name}, sid={request.sid}")
-
-    try:
-        room = get_room(room_id)
-        if not room:
-            logger.warning(f"⚠️ Room not found: {room_id}")
-            emit("error", {"message": "Room not found"})
-            return
-
-        # ✅ FIX: Check if participant already exists in this room
-        existing_participant = get_participant_by_username(room_id, user_name)
-        if existing_participant:
-            logger.info(f"👤 Participant {user_name} already in room {room_id}, reconnecting")
-            # Update their socket ID
-            supabase.table('participants').update({
-                'socket_id': request.sid,
-                'updated_at': datetime.now(timezone.utc).isoformat()
-            }).eq('id', existing_participant['id']).execute()
-        else:
-            # Add new participant
-            participant = add_participant(
-                room_id=room_id,
-                username=user_name,
-                socket_id=request.sid,
-                display_name=user_name
-            )
-            logger.info(f"✅ New participant added: {user_name} → room {room_id}")
-
-        join_room(room_id)
-
-        # Get chat history
-        history = get_chat_history(room_id)
-        chat_history = [
-            {
-                "sender": msg['username'],
-                "message": msg['message'],
-                "timestamp": msg['created_at']
-            }
-            for msg in history
-        ]
-
-        # Get current participants (deduplicated)
-        participants = get_participants(room_id)
-        participant_names = list(set([p['username'] for p in participants if p.get('username')]))
-        
-        # ✅ FIX: Always include the current user
-        if user_name not in participant_names:
-            participant_names.append(user_name)
-
-        logger.info(f"📜 Sending {len(chat_history)} messages to {user_name}")
-        logger.info(f"👥 Current participants: {participant_names}")
-
-        emit("joined_room", {"room_id": room_id}, to=request.sid)
-        emit("chat_history", {
-            "chat_history": chat_history,
-            "participants": participant_names
-        }, to=request.sid)
-        
-        emit("participants_update", {
-            "participants": participant_names,
-            "new_user": user_name
-        }, room=room_id)
-
-        # Try to start story
-        socketio.start_background_task(lambda: start_story_for_room(room_id))
-
-    except Exception as e:
-        logger.error(f"❌ Error joining room: {e}", exc_info=True)
-        emit("error", {"message": "Failed to join room"})
-
-@socketio.on("send_message")
-def send_message_handler(data):
-    """Handle user message"""
-    room_id = data.get("room_id")
-    sender = data.get("sender")
-    msg = (data.get("message") or "").strip()
-
-    if not msg:
-        return
-
-    logger.info(f"💬 Message from {sender} in room {room_id}: {msg[:50]}...")
-
-    try:
-        room = get_room(room_id)
-        if not room or room.get('story_finished'):
-            logger.warning(f"⚠️ Cannot send message - room {room_id} finished or not found")
-            return
-
-        add_message(
-            room_id=room_id,
-            username=sender,
-            message=msg,
-            message_type="chat"
-        )
-
-        emit(
-            "receive_message",
-            {"sender": sender, "message": msg, "timestamp": datetime.now().isoformat()},
-            room=room_id,
-        )
-
-        logger.info(f"✅ Message sent to room {room_id}")
-
-    except Exception as e:
-        logger.error(f"❌ Error sending message: {e}", exc_info=True)
 
 # ============================================================
 # TTS & STT Endpoints
@@ -1384,6 +1786,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "llm_provider": LLM_PROVIDER,
+        "openai_available": openai_client is not None,
         "groq_available": groq_client is not None,
         "audio_support": AUDIO_SUPPORT,
         "session_summaries": True,
@@ -1401,7 +1804,10 @@ if __name__ == "__main__":
     logger.info(f"📍 Host: 0.0.0.0:{port}")
     logger.info(f"🌐 Frontend: {FRONTEND_URL}")
     logger.info(f"🤖 LLM Provider: {LLM_PROVIDER}")
-    logger.info(f"📊 Groq Model: {GROQ_MODEL}")
+    if LLM_PROVIDER == "openai":
+        logger.info(f"📊 OpenAI Model: {OPENAI_MODEL}")
+    else:
+        logger.info(f"📊 Groq Model: {GROQ_MODEL}")
     logger.info(f"📝 Session Summaries: ENABLED")
     logger.info(f"💬 Feedback Delivery: 3-Method Guaranteed")
     logger.info("="*60)
@@ -1418,7 +1824,3 @@ if __name__ == "__main__":
         logger.error(f"❌ Failed to start server: {e}")
         import traceback
         traceback.print_exc()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Render sets this
-    socketio.run(app, host="0.0.0.0", port=port, debug=False)

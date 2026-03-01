@@ -1,162 +1,321 @@
 # ============================================================
-# 📦 data_retriever.py — Local Story Loader
+# 📦 data_retriever.py — ENHANCED DESERT SURVIVAL SCENARIOS
 # ============================================================
 from __future__ import annotations
 import os
 import json
-import random
 import logging
+import random
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger("moderator-data")
 
 # ============================================================
-# 📘 Story File Cache Directory
+# 🏜️ THREE DESERT SURVIVAL SCENARIOS (Still desert themed!)
 # ============================================================
-STORY_CACHE_DIR = os.path.join(os.getcwd(), "stories")
-os.makedirs(STORY_CACHE_DIR, exist_ok=True)
 
-# ============================================================
-# 🧩 Fallback Story
-# ============================================================
-_FALLBACK = {
-    "story_id": "fallback-lantern",
-    "story_name": "The Lantern and the Little Dragon",
-    "context": (
-        "On the edge of a misty village, a paper lantern flickered to life each dusk. "
-        "One evening, a tiny dragon curled around its handle, sneezing sparks that "
-        "drew curious eyes. The villagers, once afraid, learned the dragon was "
-        "lonely, not dangerous. They left bowls of rice outside their doors to keep "
-        "its flame warm."
-    ),
-    "story_text": (
-        "On the edge of a misty village stood a flickering lantern. One night, a tiny "
-        "dragon wrapped around it, sneezing sparks. The villagers discovered it was "
-        "lonely, not dangerous, so they fed it warm rice. Over time, the dragon "
-        "became their quiet guardian, lighting paths at night. The village grew safe "
-        "and peaceful as its golden flame glowed."
-    ),
-    "sentences": [
-        "On the edge of a misty village stood a flickering lantern.",
-        "One night, a tiny dragon wrapped around it, sneezing sparks.",
-        "The villagers discovered it was lonely, not dangerous.",
-        "They fed it warm rice.",
-        "The dragon became their quiet guardian, lighting paths at night.",
-        "Its golden flame kept the village peaceful."
-    ]
+SCENARIO_1 = {
+    "task_id": "desert_survival_plane_crash",
+    "task_name": "Desert Plane Crash Survival",
+    "description": """
+**BACKGROUND STORY:**
+
+You and your two teammates were passengers on a small charter plane flying over the Arizona desert when the engine failed. The pilot managed to make an emergency landing, but the plane was damaged on impact. The pilot is unconscious and needs help.
+
+It's 2 PM in mid-July. The temperature is 110°F (43°C). You're approximately 80 miles from the nearest town. The plane has a emergency beacon, but it's damaged and not working. You have no cell service.
+
+**YOUR SITUATION:**
+• You have moderate injuries - some cuts and bruises, but everyone can walk
+• You have about 2-3 hours before sunset
+• Nights in the desert can drop to 60°F (15°C)
+• There's no water source visible in any direction
+
+**THE ITEMS:**
+From the crashed plane, you've managed to salvage the following 12 items:
+""",
+    "items": [
+        "A flashlight (4 batteries included)",
+        "A map of the region",
+        "A compass",
+        "A large plastic sheet (6x8 feet)",
+        "A box of matches",
+        "A winter coat",
+        "A bottle of salt tablets (1000 tablets)",
+        "A small hunting knife",
+        "2 quarts of water per person (6 quarts total)",
+        "A cosmetic mirror",
+        "A parachute (red & white, 30ft diameter)",
+        "A book - 'Edible Animals of the Desert'"
+    ],
+    "expert_ranking": {
+        "A cosmetic mirror": 1,
+        "2 quarts of water per person (6 quarts total)": 2,
+        "A flashlight (4 batteries included)": 3,
+        "A parachute (red & white, 30ft diameter)": 4,
+        "A small hunting knife": 5,
+        "A large plastic sheet (6x8 feet)": 6,
+        "A box of matches": 7,
+        "A winter coat": 8,
+        "A compass": 9,
+        "A map of the region": 10,
+        "A bottle of salt tablets (1000 tablets)": 11,
+        "A book - 'Edible Animals of the Desert'": 12
+    }
+}
+
+SCENARIO_2 = {
+    "task_id": "desert_survival_lost_hikers",
+    "task_name": "Lost Hikers in the Desert",
+    "description": """
+**BACKGROUND STORY:**
+
+You and your two friends are experienced hikers who decided to explore a remote canyon in the southwestern desert. You planned a day hike, but took a wrong turn and now you're lost. It's getting late, and you realize you won't make it back to your car before nightfall.
+
+**WHAT HAPPENED:**
+You started at 8 AM with plenty of water and snacks. By 2 PM, you realized you were off-trail. You've been trying to find your way back for 3 hours, and now it's 5 PM. You have about 2 hours of daylight left. Temperatures during the day reached 105°F, and nights will drop to 65°F.
+
+**YOUR CURRENT SITUATION:**
+• Everyone is tired but in good health
+• You have minimal supplies from your day packs
+• You told someone your general plans, but not exactly where you were going
+• Search and rescue might be dispatched by tomorrow morning if you don't return
+
+**ITEMS IN YOUR PACKS:**
+You check your day packs and find the following items:
+""",
+    "items": [
+        "A flashlight (with weak batteries)",
+        "A topographic map of the region",
+        "A compass",
+        "An emergency space blanket (thin plastic sheet)",
+        "A lighter (almost out of fuel)",
+        "A light windbreaker jacket",
+        "A small container of salt tablets (50 tablets)",
+        "A multi-tool with knife",
+        "Water bottles - 2 quarts total (shared)",
+        "A compact mirror",
+        "An orange emergency tarp (bright color)",
+        "A field guide to desert plants"
+    ],
+    "expert_ranking": {
+        "A compact mirror": 1,
+        "Water bottles - 2 quarts total (shared)": 2,
+        "A flashlight (with weak batteries)": 3,
+        "An orange emergency tarp (bright color)": 4,
+        "A multi-tool with knife": 5,
+        "An emergency space blanket (thin plastic sheet)": 6,
+        "A lighter (almost out of fuel)": 7,
+        "A light windbreaker jacket": 8,
+        "A compass": 9,
+        "A topographic map of the region": 10,
+        "A small container of salt tablets (50 tablets)": 11,
+        "A field guide to desert plants": 12
+    }
+}
+
+SCENARIO_3 = {
+    "task_id": "desert_survival_broken_vehicle",
+    "task_name": "Broken Down in the Desert",
+    "description": """
+**BACKGROUND STORY:**
+
+You and two friends are driving through the desert on a road trip when your SUV overheats and breaks down. There's no cell service, and you haven't seen another car for hours. It's midday, temperature is 108°F, and you're 50 miles from the nearest town.
+
+**WHAT HAPPENED:**
+The radiator cracked and all the coolant leaked out. The engine is too hot to touch. You have some basic supplies in the vehicle, but not enough water for a long hike. You have to decide whether to stay with the vehicle (easier for rescue to spot) or try to walk for help.
+
+**YOUR CURRENT SITUATION:**
+• Everyone is healthy but worried
+• The vehicle provides some shade but will be extremely hot inside
+• You have a few hours before sunset
+• Nights will be cold (around 55°F)
+• You left your travel itinerary with family, so search parties will be looking
+
+**ITEMS IN YOUR VEHICLE:**
+Searching your SUV, you find these items:
+""",
+    "items": [
+        "A flashlight (with fresh batteries)",
+        "A road map of the state",
+        "A compass from the glove box",
+        "A tarp for covering luggage",
+        "A lighter from the cigarette lighter",
+        "Hoodies and jackets (3)",
+        "Salt packets from fast food (about 50 packets)",
+        "A multi-tool with knife",
+        "Water bottles - 3 quarts total",
+        "A small mirror from the visor",
+        "An orange emergency triangle (reflector)",
+        "A desert survival guide book"
+    ],
+    "expert_ranking": {
+        "A small mirror from the visor": 1,
+        "Water bottles - 3 quarts total": 2,
+        "A flashlight (with fresh batteries)": 3,
+        "An orange emergency triangle (reflector)": 4,
+        "A multi-tool with knife": 5,
+        "A tarp for covering luggage": 6,
+        "A lighter from the cigarette lighter": 7,
+        "Hoodies and jackets (3)": 8,
+        "A compass from the glove box": 9,
+        "A road map of the state": 10,
+        "Salt packets from fast food (about 50 packets)": 11,
+        "A desert survival guide book": 12
+    }
+}
+
+# Dictionary of all scenarios
+ALL_SCENARIOS = {
+    "plane_crash": SCENARIO_1,
+    "lost_hikers": SCENARIO_2,
+    "broken_vehicle": SCENARIO_3,
 }
 
 # ============================================================
-# 📂 Load Random Story from Local Files
+# 📂 Load Task Data (Randomly selects a scenario)
 # ============================================================
 def get_data(story_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Load a story from local JSON files.
-
+    Returns a desert survival scenario.
+    If story_id is provided and matches a scenario key, returns that scenario.
+    Otherwise returns a random scenario for variety.
+    
     Args:
-        story_id: Optional specific story ID to load. If None, loads random story.
-
+        story_id: Optional scenario key ('plane_crash', 'lost_hikers', 'broken_vehicle')
+        
     Returns:
-        Story dict with story_id, story_name, sentences, etc.
+        Desert survival scenario dictionary
     """
-    try:
-        # Get all JSON files in stories directory
-        files = [f for f in os.listdir(STORY_CACHE_DIR) if f.endswith(".json")]
-
-        if not files:
-            logger.warning("[Story] No cached stories found, using fallback")
-            return dict(_FALLBACK)
-
-        # If specific story requested, try to find it
-        if story_id:
-            matching_file = None
-            for f in files:
-                file_path = os.path.join(STORY_CACHE_DIR, f)
-                try:
-                    with open(file_path, "r", encoding="utf-8") as fp:
-                        story = json.load(fp)
-                        if story.get("story_id") == story_id or f.replace(".json", "") == story_id:
-                            matching_file = file_path
-                            break
-                except:
-                    continue
-
-            if matching_file:
-                with open(matching_file, "r", encoding="utf-8") as fp:
-                    story = json.load(fp)
-                logger.info(f"[Story] Loaded specific story: {story.get('story_id', story.get('story_name'))}")
-                return story
-            else:
-                logger.warning(f"[Story] Story {story_id} not found, loading random")
-
-        # Load random story
-        random_file = random.choice(files)
-        file_path = os.path.join(STORY_CACHE_DIR, random_file)
-
-        with open(file_path, "r", encoding="utf-8") as fp:
-            story = json.load(fp)
-
-        # Ensure story_id exists
-        if "story_id" not in story:
-            story["story_id"] = random_file.replace(".json", "")
-
-        logger.info(f"[Story] Loaded random story: {story.get('story_id', story.get('story_name'))} from {random_file}")
-        return story
-
-    except Exception as e:
-        logger.error(f"[Story] Error loading story: {e}", exc_info=True)
-        logger.warning("[Story] Using fallback story")
-        return dict(_FALLBACK)
+    if story_id and story_id in ALL_SCENARIOS:
+        scenario = ALL_SCENARIOS[story_id]
+        logger.info(f"📖 Selected specific scenario: {scenario['task_name']}")
+        return scenario
+    
+    # Randomly select a scenario for variety
+    scenario_key = random.choice(list(ALL_SCENARIOS.keys()))
+    scenario = ALL_SCENARIOS[scenario_key]
+    logger.info(f"🎲 Randomly selected scenario: {scenario['task_name']}")
+    return scenario
 
 # ============================================================
-# 🪄 Generate Story Intro
+# 🪄 Generate Task Introduction
 # ============================================================
-def get_story_intro(story_block: dict) -> str:
-    """Generate introduction text from story block"""
-    story_name = story_block.get("story_name", "our story")
-    context = story_block.get("context", "").strip()
+def get_story_intro(task_data: dict) -> str:
+    """Generate introduction text for the desert survival scenario"""
+    task_name = task_data.get("task_name", "Desert Survival")
+    description = task_data.get("description", "").strip()
+    
+    # Format items list for display
+    items = task_data.get("items", [])
+    items_text = "\n".join([f"• {item}" for item in items])
+    
+    return f"""
+**{task_name}**
 
-    if context:
-        # Use first sentence of context
-        first_sentence = context.split(".")[0].strip() + "."
-        return f"Welcome to '{story_name}'. {first_sentence}"
+{description}
 
-    story_text = story_block.get("story_text", "").strip()
-    if story_text:
-        first_sentence = story_text.split(".")[0].strip() + "."
-        return f"Let's begin '{story_name}'. {first_sentence}"
+**Items to rank:**
+{items_text}
 
-    return f"Let's begin our story: {story_name}."
+**Your task:**
+1. Rank the items from 1 (most important for survival) to 12 (least important)
+2. Agree on one final group ranking
+3. Be prepared to briefly explain your reasoning
+
+You have 15 minutes to reach consensus.
+"""
 
 # ============================================================
-# 🧱 Format Story Block (for debug)
+# 🧱 Format Task Block (for display/debug)
 # ============================================================
-def format_story_block(story_block: dict, full: bool = False) -> str:
-    """Format story block for display"""
-    name = story_block.get("story_name", "Unknown Story")
-    story_text = story_block.get("story_text", "")
-    context = story_block.get("context", "")
-    sentences = story_block.get("sentences", [])
-
+def format_story_block(task_data: dict, full: bool = False) -> str:
+    """Format task for display"""
+    name = task_data.get("task_name", "Desert Survival")
+    description = task_data.get("description", "").strip()
+    items = task_data.get("items", [])
+    
+    items_text = "\n".join([f"• {item}" for item in items])
+    
     if not full:
-        return f"Story: {name}\n\n{context}"
+        return f"Task: {name}\n\n{description[:200]}...\n\nItems:\n{items_text[:200]}..."
+    
+    return f"""
+Task: {name}
+{'='*50}
 
-    return (
-        f"Story: {name}\n\n"
-        f"{context}\n\n"
-        f"Full text:\n{story_text}\n\n"
-        f"Sentences ({len(sentences)}):\n"
-        + "\n".join(f"- {s}" for s in sentences)
-    )
+{description}
+
+Items to rank:
+{items_text}
+
+Total items: {len(items)}
+"""
 
 # ============================================================
-# 📋 List Available Stories
+# 📋 Get Task Items (for UI display)
 # ============================================================
-def list_available_stories() -> list[str]:
-    """List all available story IDs"""
-    try:
-        files = [f.replace(".json", "") for f in os.listdir(STORY_CACHE_DIR) if f.endswith(".json")]
-        return sorted(files)
-    except Exception as e:
-        logger.error(f"[Story] Error listing stories: {e}")
-        return []
+def get_task_items(task_data: Optional[dict] = None) -> list[str]:
+    """Return the list of items for the current scenario"""
+    if task_data is None:
+        task_data = get_data()
+    return task_data.get("items", [])
+
+# ============================================================
+# 🎯 Compare Ranking with Expert Ranking
+# ============================================================
+def compare_with_expert_ranking(user_ranking: list, task_data: Optional[dict] = None) -> dict:
+    """
+    Compare a user's ranking with the expert ranking
+    
+    Args:
+        user_ranking: List of items in ranked order (1 = most important)
+        task_data: The scenario data containing expert ranking
+        
+    Returns:
+        Dict with comparison metrics
+    """
+    if task_data is None:
+        task_data = get_data()
+    
+    expert = task_data.get("expert_ranking", {})
+    
+    # Calculate score (lower is better - like golf)
+    score = 0
+    item_scores = {}
+    
+    for position, item in enumerate(user_ranking, 1):
+        expert_pos = expert.get(item, 12)
+        diff = abs(position - expert_pos)
+        score += diff
+        item_scores[item] = {
+            "user_rank": position,
+            "expert_rank": expert_pos,
+            "difference": diff
+        }
+    
+    # Maximum possible difference (for 12 items, max diff is 66)
+    max_possible = 66
+    
+    return {
+        "total_score": score,
+        "max_possible": max_possible,
+        "accuracy_percentage": max(0, 100 - (score / max_possible * 100)),
+        "item_scores": item_scores,
+        "user_ranking": user_ranking,
+        "expert_ranking": sorted(expert.items(), key=lambda x: x[1])
+    }
+
+# ============================================================
+# 🎲 Get Random Scenario (for admin/research)
+# ============================================================
+def get_random_scenario() -> Dict[str, Any]:
+    """Return a random desert survival scenario"""
+    scenario_key = random.choice(list(ALL_SCENARIOS.keys()))
+    return ALL_SCENARIOS[scenario_key]
+
+# ============================================================
+# 📚 List All Available Scenarios
+# ============================================================
+def list_scenarios() -> Dict[str, str]:
+    """Return a dictionary of scenario keys and names"""
+    return {key: scenario["task_name"] for key, scenario in ALL_SCENARIOS.items()}

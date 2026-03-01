@@ -1,5 +1,5 @@
 """
-Admin API Endpoints - COMPLETE FIXED VERSION
+Admin API Endpoints - COMPLETE FIXED VERSION WITH OPENAI SUPPORT
 ===================
 Backend API for admin panel - Fixed room creation with max_participants
 """
@@ -190,7 +190,7 @@ def export_room_chat(room_id: str):
         elif format_type == 'csv':
             output = StringIO()
             if messages:
-                fieldnames = ['id', 'username', 'message', 'message_type', 'created_at']
+                fieldnames = ['id', 'username', 'message', 'message_type', 'created_at', 'word_count']
                 writer = csv.DictWriter(output, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(messages)
@@ -209,7 +209,7 @@ def export_room_chat(room_id: str):
         elif format_type == 'tsv':
             output = StringIO()
             if messages:
-                fieldnames = ['id', 'username', 'message', 'message_type', 'created_at']
+                fieldnames = ['id', 'username', 'message', 'message_type', 'created_at', 'word_count']
                 writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter='\t')
                 writer.writeheader()
                 writer.writerows(messages)
@@ -413,7 +413,7 @@ def update_room_status_admin(room_id: str):
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
-# Settings Management
+# Settings Management - UPDATED WITH OPENAI SUPPORT
 # ============================================================
 
 @admin_bp.route('/settings', methods=['GET'])
@@ -447,7 +447,7 @@ def get_all_settings():
 def get_setting(key: str):
     """Get specific setting by key"""
     try:
-        response = supabase.table('settings').select('*').eq('key', key).single().execute()
+        response = supabase.table('settings').select('*').eq('key', key).maybe_single().execute()
         
         if not response.data:
             return jsonify({"error": "Setting not found"}), 404
@@ -468,23 +468,36 @@ def update_setting(key: str):
         if new_value is None:
             return jsonify({"error": "Value is required"}), 400
         
-        response = supabase.table('settings').update({
-            'value': str(new_value),
-            'updated_by': data.get('updated_by', 'admin'),
-            'updated_at': datetime.now(timezone.utc).isoformat()
-        }).eq('key', key).execute()
+        # Check if setting exists
+        check = supabase.table('settings').select('*').eq('key', key).maybe_single().execute()
         
-        if not response.data:
-            return jsonify({"error": "Setting not found"}), 404
+        if check.data:
+            # Update existing
+            response = supabase.table('settings').update({
+                'value': str(new_value),
+                'updated_by': data.get('updated_by', 'admin'),
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }).eq('key', key).execute()
+        else:
+            # Create new setting with default type
+            response = supabase.table('settings').insert({
+                'key': key,
+                'value': str(new_value),
+                'data_type': 'string',
+                'category': 'llm',
+                'description': f'Setting for {key}',
+                'updated_by': data.get('updated_by', 'admin'),
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+                'created_at': datetime.now(timezone.utc).isoformat()
+            }).execute()
         
         log_admin_action('update_setting', 'setting', None, {
             'key': key,
-            'old_value': data.get('old_value'),
             'new_value': new_value
         }, data.get('admin_user', 'unknown'))
         
         logger.info(f"✅ Admin: Updated setting {key} = {new_value}")
-        return jsonify(response.data[0])
+        return jsonify(response.data[0] if response.data else {"success": True})
     
     except Exception as e:
         logger.error(f"❌ Error updating setting {key}: {e}", exc_info=True)
@@ -520,30 +533,272 @@ def get_admin_logs():
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
-# Helper: Get Setting Value
+# Helper: Get Setting Value - UPDATED WITH BETTER ERROR HANDLING
 # ============================================================
 
 def get_setting_value(key: str, default=None):
     """Get a setting value from database with type conversion."""
     try:
-        response = supabase.table('settings').select('*').eq('key', key).single().execute()
+        # Use maybe_single() instead of single() to avoid 404 errors
+        response = supabase.table('settings').select('*').eq('key', key).maybe_single().execute()
         
         if not response.data:
+            logger.debug(f"Setting {key} not found, using default: {default}")
             return default
         
         setting = response.data
-        value_str = setting['value']
+        value_str = setting.get('value')
         data_type = setting.get('data_type', 'string')
         
-        if data_type == 'integer':
-            return int(value_str)
-        elif data_type == 'float':
-            return float(value_str)
-        elif data_type == 'boolean':
-            return value_str.lower() in ('true', '1', 'yes')
-        else:
-            return value_str
+        if value_str is None:
+            return default
+        
+        try:
+            if data_type == 'integer':
+                return int(value_str)
+            elif data_type == 'float':
+                return float(value_str)
+            elif data_type == 'boolean':
+                return value_str.lower() in ('true', '1', 'yes', 'on')
+            else:
+                return value_str
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to convert setting {key} value '{value_str}' to {data_type}: {e}")
+            return default
     
     except Exception as e:
         logger.warning(f"Failed to get setting {key}, using default: {e}")
         return default
+
+# ============================================================
+# RESEARCH EXPORT ENDPOINTS - SINGLE VERSION (NO DUPLICATES)
+# ============================================================
+
+@admin_bp.route('/research/export', methods=['GET'])
+def export_research_data():
+    """Export all research data for analysis (JSON or CSV)"""
+    try:
+        format_type = request.args.get('format', 'json').lower()
+        condition = request.args.get('condition')  # 'active' or 'passive'
+        
+        # Get all completed rooms with their data
+        query = supabase.table("rooms")\
+            .select("""
+                id,
+                mode,
+                condition,
+                created_at,
+                ended_at,
+                final_ranking,
+                research_metrics(*),
+                moderator_interventions(*),
+                participant_metrics(*),
+                task_results(*)
+            """)\
+            .not_.is_("ended_at", "null")\
+            .order("created_at", desc=True)
+        
+        if condition:
+            query = query.eq("mode", condition)
+        
+        response = query.execute()
+        rooms = response.data if response.data else []
+        
+        # Calculate summary statistics
+        summary = {
+            "total_sessions": len(rooms),
+            "active_sessions": len([r for r in rooms if r.get('mode') == 'active']),
+            "passive_sessions": len([r for r in rooms if r.get('mode') == 'passive']),
+            "avg_gini": 0,
+            "avg_dominance_gap": 0,
+            "avg_accuracy": 0,
+            "total_conflicts": 0,
+            "total_interventions": 0
+        }
+        
+        # Calculate averages
+        gini_values = []
+        dominance_values = []
+        accuracy_values = []
+        conflict_counts = []
+        intervention_counts = []
+        
+        for room in rooms:
+            if room.get('research_metrics'):
+                for metric in room['research_metrics']:
+                    if metric.get('gini_coefficient'):
+                        gini_values.append(metric['gini_coefficient'])
+                    if metric.get('dominance_gap'):
+                        dominance_values.append(metric['dominance_gap'])
+                    if metric.get('ranking_accuracy'):
+                        accuracy_values.append(metric['ranking_accuracy'])
+                    if metric.get('conflict_count'):
+                        conflict_counts.append(metric['conflict_count'])
+            
+            if room.get('moderator_interventions'):
+                intervention_counts.append(len(room['moderator_interventions']))
+        
+        if gini_values:
+            summary['avg_gini'] = sum(gini_values) / len(gini_values)
+        if dominance_values:
+            summary['avg_dominance_gap'] = sum(dominance_values) / len(dominance_values)
+        if accuracy_values:
+            summary['avg_accuracy'] = sum(accuracy_values) / len(accuracy_values)
+        if conflict_counts:
+            summary['avg_conflicts_per_session'] = sum(conflict_counts) / len(conflict_counts)
+        if intervention_counts:
+            summary['avg_interventions_per_session'] = sum(intervention_counts) / len(intervention_counts)
+        
+        # Return based on format
+        if format_type == 'json':
+            return jsonify({
+                "success": True,
+                "summary": summary,
+                "rooms": rooms,
+                "exported_at": datetime.now(timezone.utc).isoformat()
+            })
+        
+        elif format_type == 'csv':
+            # Create CSV with flattened data
+            output = StringIO()
+            writer = csv.writer(output)
+            
+            # Header
+            writer.writerow([
+                'room_id', 'condition', 'gini_coefficient', 'dominance_gap', 
+                'ranking_accuracy', 'total_messages', 'conflict_count', 
+                'intervention_count', 'time_to_consensus'
+            ])
+            
+            for room in rooms:
+                metrics = room.get('research_metrics', [{}])[0] if room.get('research_metrics') else {}
+                writer.writerow([
+                    room['id'],
+                    room.get('mode'),
+                    metrics.get('gini_coefficient', ''),
+                    metrics.get('dominance_gap', ''),
+                    metrics.get('ranking_accuracy', ''),
+                    metrics.get('total_messages', ''),
+                    metrics.get('conflict_count', 0),
+                    len(room.get('moderator_interventions', [])),
+                    metrics.get('time_to_consensus', '')
+                ])
+            
+            csv_data = output.getvalue()
+            output.close()
+            
+            response = make_response(csv_data)
+            response.headers['Content-Type'] = 'text/csv'
+            response.headers['Content-Disposition'] = f'attachment; filename=research_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            return response
+        
+        else:
+            return jsonify({"error": f"Unsupported format: {format_type}. Use json or csv"}), 400
+    
+    except Exception as e:
+        logger.error(f"❌ Error exporting research data: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@admin_bp.route('/research/metrics/<room_id>', methods=['GET'])
+def get_room_research_metrics(room_id: str):
+    """Get detailed research metrics for a specific room"""
+    try:
+        # Get room info
+        room_response = supabase.table("rooms").select("*").eq("id", room_id).maybe_single().execute()
+        room = room_response.data if room_response.data else {}
+        
+        # Get metrics
+        metrics_response = supabase.table("research_metrics").select("*").eq("room_id", room_id).execute()
+        metrics = metrics_response.data if metrics_response.data else []
+        
+        # Get interventions
+        interventions_response = supabase.table("moderator_interventions").select("*").eq("room_id", room_id).order("timestamp").execute()
+        interventions = interventions_response.data if interventions_response.data else []
+        
+        # Get participant metrics
+        participant_response = supabase.table("participant_metrics").select("*").eq("room_id", room_id).execute()
+        participants = participant_response.data if participant_response.data else []
+        
+        # Get task results
+        task_response = supabase.table("task_results").select("*").eq("room_id", room_id).execute()
+        task = task_response.data[0] if task_response.data else {}
+        
+        return jsonify({
+            "room": room,
+            "metrics": metrics,
+            "interventions": interventions,
+            "participants": participants,
+            "task": task
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting room metrics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@admin_bp.route('/research/summary', methods=['GET'])
+def get_research_summary():
+    """Get summary statistics comparing active vs passive conditions"""
+    try:
+        # Get all completed rooms
+        rooms_response = supabase.table("rooms")\
+            .select("id, mode")\
+            .not_.is_("ended_at", "null")\
+            .execute()
+        
+        rooms = rooms_response.data if rooms_response.data else []
+        
+        # Get all metrics
+        metrics_response = supabase.table("research_metrics").select("*").execute()
+        all_metrics = metrics_response.data if metrics_response.data else []
+        
+        # Separate by condition
+        active_metrics = []
+        passive_metrics = []
+        
+        for metric in all_metrics:
+            room_id = metric.get('room_id')
+            room = next((r for r in rooms if r['id'] == room_id), {})
+            condition = room.get('mode')
+            
+            if condition == 'active':
+                active_metrics.append(metric)
+            elif condition == 'passive':
+                passive_metrics.append(metric)
+        
+        def avg_metrics(metrics_list, key):
+            values = [m.get(key) for m in metrics_list if m.get(key) is not None]
+            return sum(values) / len(values) if values else 0
+        
+        summary = {
+            "total_sessions": len(rooms),
+            "active_sessions": len(active_metrics),
+            "passive_sessions": len(passive_metrics),
+            "active": {
+                "avg_gini": avg_metrics(active_metrics, 'gini_coefficient'),
+                "avg_dominance_gap": avg_metrics(active_metrics, 'dominance_gap'),
+                "avg_conflict_count": avg_metrics(active_metrics, 'conflict_count'),
+                "avg_repair_rate": avg_metrics(active_metrics, 'repair_rate'),
+                "avg_accuracy": avg_metrics(active_metrics, 'ranking_accuracy'),
+                "avg_messages": avg_metrics(active_metrics, 'total_messages'),
+                "avg_time_to_consensus": avg_metrics(active_metrics, 'time_to_consensus'),
+                "total_interventions": sum(metric.get('intervention_count', 0) for metric in active_metrics)
+            },
+            "passive": {
+                "avg_gini": avg_metrics(passive_metrics, 'gini_coefficient'),
+                "avg_dominance_gap": avg_metrics(passive_metrics, 'dominance_gap'),
+                "avg_conflict_count": avg_metrics(passive_metrics, 'conflict_count'),
+                "avg_repair_rate": avg_metrics(passive_metrics, 'repair_rate'),
+                "avg_accuracy": avg_metrics(passive_metrics, 'ranking_accuracy'),
+                "avg_messages": avg_metrics(passive_metrics, 'total_messages'),
+                "avg_time_to_consensus": avg_metrics(passive_metrics, 'time_to_consensus'),
+                "total_interventions": sum(metric.get('intervention_count', 0) for metric in passive_metrics)
+            }
+        }
+        
+        return jsonify(summary)
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting research summary: {e}")
+        return jsonify({"error": str(e)}), 500
