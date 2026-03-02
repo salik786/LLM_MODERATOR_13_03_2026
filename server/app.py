@@ -141,16 +141,31 @@ allowed_origins = [
 logger.info(f"🔒 CORS allowed origins: {allowed_origins}")
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=True)
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://llm-moderator-39gf.vercel.app",
+            "http://localhost:3000",
+            "http://localhost:3001"
+        ],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True
+    }
+})
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*",  # Allow ALL origins temporarily
+    cors_allowed_origins=[
+        "https://llm-moderator-39gf.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001"
+    ],
     async_mode="threading",
     logger=True,
     engineio_logger=True,
-    transports=['polling'],  # Force polling only (no websocket)
-    allow_upgrades=False,     # Prevent upgrade attempts
+    transports=['polling'],  # Force polling only for now
+    allow_upgrades=False,
     ping_timeout=60,
     ping_interval=25,
     max_http_buffer_size=1e8,
