@@ -164,7 +164,7 @@ socketio = SocketIO(
     async_mode="threading",
     logger=True,
     engineio_logger=True,
-    transports=['polling'],  # Force polling only for now
+    transports=["websocket","polling"],  # Force polling only for now
     allow_upgrades=False,
     ping_timeout=60,
     ping_interval=25,
@@ -185,6 +185,18 @@ def handle_connect_error(error):
 @socketio.on('disconnect')
 def handle_disconnect():
     logger.info(f"🔌 SOCKET DISCONNECTED: {request.sid}")
+# Add after your socketio initialization
+@socketio.on('ping')
+def handle_ping(data):
+    """Respond to client pings to keep connection alive"""
+    emit('pong', {'timestamp': data.get('timestamp', 0)})
+
+# Add this middleware to keep responses alive
+@app.after_request
+def add_keep_alive_headers(response):
+    response.headers.add('Connection', 'keep-alive')
+    response.headers.add('Keep-Alive', 'timeout=60, max=1000')
+    return response
 # ============================================================
 # Room State Management
 # ============================================================
