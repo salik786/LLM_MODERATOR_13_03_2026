@@ -1,3 +1,4 @@
+from __future__ import annotations
 import eventlet
 eventlet.monkey_patch()
 
@@ -6,7 +7,6 @@ eventlet.monkey_patch()
 # WITH DESERT SURVIVAL TASK AND ACTIVE/PASSIVE MODERATION
 # Following exact experiment design specifications
 # ============================================================
-from __future__ import annotations
 
 import os
 import uuid
