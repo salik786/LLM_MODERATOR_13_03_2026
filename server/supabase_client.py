@@ -7,12 +7,19 @@ Includes ALL functions for admin panel, session summaries, and exports.
 
 import os
 import uuid
+import time
 import logging
 import json
-from typing import Dict, List, Any, Optional
+import functools
+from typing import Dict, List, Any, Optional, Callable, TypeVar
 from datetime import datetime, timezone
+
+import httpx
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 from dotenv import load_dotenv
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 load_dotenv()
 
@@ -30,9 +37,44 @@ if not SUPABASE_URL or not SUPABASE_KEY:
         "Missing Supabase credentials. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in .env"
     )
 
-# Initialize Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-logger.info("✅ Supabase client initialized")
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0):
+    """Retry transient Supabase/network failures with linear backoff."""
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc: Optional[Exception] = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    if attempt == max_retries - 1:
+                        raise
+                    wait = delay * (attempt + 1)
+                    logger.warning(
+                        f"Retry {attempt + 1}/{max_retries} for {func.__name__}: {e} (sleep {wait}s)"
+                    )
+                    time.sleep(wait)
+            raise last_exc  # pragma: no cover
+
+        return wrapper  # type: ignore
+
+    return decorator
+
+
+# Timeouts: avoid hung requests under load (PostgREST + storage + functions)
+_httpx_timeout = httpx.Timeout(10.0, connect=5.0, read=10.0, write=10.0)
+_supabase_options = ClientOptions(
+    postgrest_client_timeout=_httpx_timeout,
+    storage_client_timeout=_httpx_timeout,
+    function_client_timeout=_httpx_timeout,
+)
+
+supabase: Client = create_client(
+    SUPABASE_URL, SUPABASE_KEY, options=_supabase_options
+)
+logger.info("✅ Supabase client initialized (custom timeouts)")
 
 # ============================================================
 # Room Operations
@@ -353,6 +395,7 @@ def get_participant_by_username(room_id: str, username: str) -> Optional[Dict[st
 # Message Operations
 # ============================================================
 
+@retry_on_failure(max_retries=3, delay=1.0)
 def add_message(
     room_id: str,
     username: str,

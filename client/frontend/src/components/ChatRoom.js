@@ -88,6 +88,7 @@ export default function ChatRoom() {
   const [rankingSubmitted, setRankingSubmitted] = useState(false);
   const [timeWarning, setTimeWarning] = useState(false);
   const [draggedItem, setDraggedItem] = useState(null);
+  const [languageWarning, setLanguageWarning] = useState(null);
 
   const messagesEndRef = useRef(null);
 
@@ -158,28 +159,43 @@ export default function ChatRoom() {
 
     socket.on("receive_message", (data) => {
       console.log("📨 RECEIVED MESSAGE:", data);
-      
+
       setMessages((prev) => {
-        // Check for duplicates
-        const isDuplicate = prev.some(
-          (msg) => 
-            msg.sender === data.sender && 
+        const dupIndex = prev.findIndex(
+          (msg) =>
+            msg.sender === data.sender &&
             msg.message === data.message &&
-            Math.abs(new Date(msg.timestamp || 0) - new Date(data.timestamp || 0)) < 1000
+            Math.abs(new Date(msg.timestamp || 0) - new Date(data.timestamp || 0)) < 4000
         );
-        
-        if (isDuplicate) {
+
+        if (dupIndex >= 0) {
+          if (data.flagged) {
+            const next = [...prev];
+            next[dupIndex] = {
+              ...next[dupIndex],
+              ...data,
+              timestamp: next[dupIndex].timestamp || data.timestamp,
+            };
+            return next;
+          }
           console.log("⚠️ Duplicate message ignored");
           return prev;
         }
-        
+
         const newMessage = {
           ...data,
-          timestamp: data.timestamp || new Date().toISOString()
+          timestamp: data.timestamp || new Date().toISOString(),
         };
-        
+
         return [...prev, newMessage];
       });
+    });
+
+    socket.on("warning_message", (data) => {
+      if (data?.type === "language_warning" && data.message) {
+        setLanguageWarning(data.message);
+        window.setTimeout(() => setLanguageWarning(null), 8000);
+      }
     });
 
     socket.on("participants_update", (data) => {
@@ -241,6 +257,7 @@ export default function ChatRoom() {
       socket.off("time_warning");
       socket.off("ranking_submitted");
       socket.off("session_ended");
+      socket.off("warning_message");
     };
   }, [roomId, userName, navigate]);
 
@@ -439,7 +456,16 @@ export default function ChatRoom() {
 
   return (
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50">
-      
+      {languageWarning && (
+        <div
+          className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] max-w-lg w-[calc(100%-2rem)] rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 shadow-lg flex items-start gap-3"
+          role="alert"
+        >
+          <MdWarning className="text-amber-600 flex-shrink-0 mt-0.5" size={22} />
+          <p className="text-sm text-amber-900">{languageWarning}</p>
+        </div>
+      )}
+
       {/* 🎪 HEADER */}
       <div className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white">
         <div className="px-4 py-3 flex items-center justify-between">
@@ -524,6 +550,7 @@ export default function ChatRoom() {
               messages.map((msg, index) => {
                 const isModerator = msg.sender === "Moderator";
                 const isSystem = msg.sender === "System";
+                const isFlagged = Boolean(msg.flagged);
                 const isCurrentUser = msg.sender === userName;
                 const userColor = !isModerator && !isSystem ? getUserColor(msg.sender, userName) : null;
                 const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString([], { 
@@ -575,8 +602,18 @@ export default function ChatRoom() {
                             : isCurrentUser
                             ? 'bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-br-none'
                             : `${userColor?.bg || 'bg-gray-100'} border ${userColor?.border || 'border-gray-200'} rounded-bl-none`
-                        }`}
+                        } ${isFlagged && !isModerator && !isSystem ? 'ring-2 ring-amber-400/80 border-amber-300' : ''}`}
                       >
+                        {isFlagged && !isModerator && !isSystem && (
+                          <p
+                            className={`text-xs font-medium mb-1 flex items-center gap-1 ${
+                              isCurrentUser ? "text-amber-100" : "text-amber-800"
+                            }`}
+                          >
+                            <MdWarning className="inline" size={14} />
+                            Flagged for review
+                          </p>
+                        )}
                         <p className="whitespace-pre-wrap break-words text-sm">
                           {msg.message}
                         </p>

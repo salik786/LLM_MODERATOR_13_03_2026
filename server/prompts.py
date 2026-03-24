@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 import os
 import re
+import time
 import logging
 import random
 import traceback
@@ -169,6 +170,30 @@ def call_llm(messages, temperature=None, max_tokens=None, system_prompt=None):
                 elif "connection" in error_str:
                     logger.error("🌐 Network connection issue. Check your internet.")
                 
+                # Try Groq if OpenAI failed but Groq is available
+                if groq_client:
+                    logger.info("🟣 Retrying with Groq after OpenAI failure...")
+                    groq_messages = []
+                    if system_prompt:
+                        groq_messages.append({"role": "system", "content": system_prompt})
+                    for msg in messages:
+                        if isinstance(msg, dict):
+                            groq_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+                        else:
+                            groq_messages.append({"role": "user", "content": str(msg)})
+                    try:
+                        response = groq_client.chat.completions.create(
+                            model=GROQ_MODEL,
+                            messages=groq_messages,
+                            temperature=temperature or GROQ_TEMPERATURE,
+                            max_tokens=max_tokens or GROQ_MAX_TOKENS,
+                            stream=False,
+                        )
+                        content = response.choices[0].message.content
+                        logger.info(f"✅ Groq fallback after OpenAI error ({len(content)} chars)")
+                        return content
+                    except Exception as groq_retry_err:
+                        logger.error(f"❌ Groq fallback also failed: {groq_retry_err}")
                 return None
         
         # ===== GROQ PATH (Fallback) =====
@@ -199,6 +224,28 @@ def call_llm(messages, temperature=None, max_tokens=None, system_prompt=None):
                 return content
             except Exception as groq_error:
                 logger.error(f"❌ Groq API call failed: {groq_error}")
+                if openai_client and LLM_PROVIDER != "openai":
+                    logger.info("🟢 Retrying with OpenAI after Groq failure...")
+                    openai_messages = []
+                    if system_prompt:
+                        openai_messages.append({"role": "system", "content": system_prompt})
+                    for i, msg in enumerate(messages):
+                        if isinstance(msg, dict):
+                            openai_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+                        else:
+                            openai_messages.append({"role": "user", "content": str(msg)})
+                    try:
+                        response = openai_client.chat.completions.create(
+                            model=OPENAI_MODEL,
+                            messages=openai_messages,
+                            temperature=temperature or OPENAI_TEMPERATURE,
+                            max_tokens=max_tokens or OPENAI_MAX_TOKENS,
+                        )
+                        content = response.choices[0].message.content
+                        logger.info(f"✅ OpenAI fallback after Groq error ({len(content)} chars)")
+                        return content
+                    except Exception as oa_retry_err:
+                        logger.error(f"❌ OpenAI fallback also failed: {oa_retry_err}")
                 return None
         
         else:
@@ -249,49 +296,92 @@ def format_items_list():
 # ============================================================
 # 🚫 SLANG/INAPPROPRIATE LANGUAGE DETECTION
 # ============================================================
-# Only flag genuinely inappropriate content, not normal conversation
-INAPPROPRIATE_WORDS = [
-    # Profanity
-    'stupid', 'dumb', 'idiot', 'moron', 'loser', 
-    'shut up', 'shutup', 'crap', 'damn', 'hell',
-    # Extremely casual slang that's inappropriate for academic setting
-    'wtf', 'omg', 'lol', 'rofl', 'lmfao', 'lmao',
+BAD_PHRASES = [
+    "shut up",
+    "shutup",
+    "stfu",
+    "gtfo",
 ]
 
-# Words that should NEVER trigger a warning (common in conversation)
-SAFE_WORDS = [
-    'let\'s', 'lets', 'whats', 'what\'s', 'next', 'start', 
-    'think', 'thought', 'please', 'thanks', 'thank',
-    'help', 'question', 'understand', 'explain', 'good', 'great',
-    'interesting', 'point', 'idea', 'agree', 'disagree'
+# Single-token terms matched with word boundaries (avoids "class" → "ass", etc.)
+BAD_WORDS = [
+    "fuck",
+    "shit",
+    "damn",
+    "hell",
+    "bitch",
+    "crap",
+    "ass",
+    "stupid",
+    "dumb",
+    "idiot",
+    "moron",
+    "loser",
+    "jerk",
+    "hate",
+    "kill",
+    "die",
+    "useless",
+    "worthless",
+    "wtf",
+    "omg",
+    "lmfao",
+    "lmao",
+    "lol",
+    "rofl",
 ]
+
 
 def check_inappropriate_language(message: str) -> tuple[bool, List[str]]:
-    """Check if message contains genuinely inappropriate language or slang"""
-    if not message:
+    """
+    Detect inappropriate language for a classroom-style discussion.
+    Returns (is_inappropriate, matched_terms).
+    """
+    if not message or not message.strip():
         return False, []
-    
+
     message_lower = message.lower()
+    found: List[str] = []
+
+    for phrase in BAD_PHRASES:
+        if phrase in message_lower:
+            found.append(phrase)
+
+    for word in BAD_WORDS:
+        if re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", message_lower):
+            found.append(word)
+
+    # De-duplicate while preserving order
+    seen = set()
     found_words = []
-    
-    # First, check if it's a safe message (questions about the task)
-    if any(word in message_lower for word in ['what', 'how', 'why', 'when', 'where', 'which']):
-        # Questions are usually fine, don't warn
+    for w in found:
+        if w not in seen:
+            seen.add(w)
+            found_words.append(w)
+
+    if not found_words:
         return False, []
-    
-    # Check for safe words that might contain inappropriate substrings
-    for safe in SAFE_WORDS:
-        if safe in message_lower:
-            return False, []
-    
-    # Only check for genuinely inappropriate words
-    for word in INAPPROPRIATE_WORDS:
-        if word in message_lower:
-            # Make sure it's a whole word match where appropriate
-            if len(word) > 2:  # Avoid flagging short substrings
-                found_words.append(word)
-    
-    return len(found_words) > 0, found_words
+
+    if len(found_words) >= 2:
+        return True, found_words
+
+    aggressive_patterns = [
+        "you are",
+        "you're",
+        "youre",
+        "your idea",
+        "you idiot",
+        "you stupid",
+        "u r",
+        "so stupid",
+        "so dumb",
+        "very stupid",
+        "very dumb",
+    ]
+    if any(p in message_lower for p in aggressive_patterns):
+        return True, found_words
+
+    return False, found_words
 
 # ============================================================
 # 🟢 ACTIVE MODERATOR PROMPTS (Research Version)
@@ -624,6 +714,23 @@ def generate_passive_moderator_response(
 # ============================================================
 # ✅ FEEDBACK GENERATION
 # ============================================================
+def format_feedback_response(response: str, student_name: str) -> str:
+    """Normalize LLM feedback into the standard UI wrapper."""
+    text = (response or "").strip()
+    if not text:
+        return ""
+    if "**Your Feedback**" in text or "📊" in text:
+        return "\n" + text if not text.startswith("\n") else text
+    return f"\n📊 **Your Feedback**\n\n{text}"
+
+
+def get_fallback_feedback(
+    student_name: str, message_count: int, toxic_count: int = 0
+) -> str:
+    """Short alias for template feedback when the LLM is unavailable."""
+    return generate_detailed_fallback(student_name, message_count, [], toxic_count)
+
+
 def generate_personalized_feedback(
     student_name: str,
     message_count: int,
@@ -634,70 +741,99 @@ def generate_personalized_feedback(
     toxic_count: int = 0,
     off_topic_count: int = 0,
     chat_history: List[Dict[str, Any]] = None,
-    story_context: str = ""
+    story_context: str = "",
+    chat_sender_name: Optional[str] = None,
 ) -> str:
-    """Generate detailed feedback with Strengths, Areas for Improvement, and Next Steps."""
+    """
+    Generate personalized feedback via Groq/OpenAI when configured, with template fallback.
+    chat_sender_name: username as it appears in chat_history 'sender' (defaults to student_name).
+    """
+    student_messages: List[str] = []
+    sender_key = chat_sender_name if chat_sender_name is not None else student_name
+
     try:
-        student_messages = []
         if chat_history:
-            student_messages = [msg.get('message', '') for msg in chat_history if msg.get('sender') == student_name]
-        
-        # Check for inappropriate language in student's messages
-        inappropriate_count = 0
-        if student_messages:
-            for msg in student_messages:
-                is_inappropriate, _ = check_inappropriate_language(msg)
-                if is_inappropriate:
-                    inappropriate_count += 1
-        
-        if student_messages:
-            messages_text = "\n".join([f"- {msg}" for msg in student_messages[-5:]])
-            logger.info(f"📝 Found {len(student_messages)} messages from {student_name}")
-        else:
-            messages_text = "No messages sent."
-        
-        # Use OpenAI for feedback if available
-        if openai_client and LLM_PROVIDER == "openai":
-            prompt = f"""You are an expert educational facilitator providing personalized feedback.
+            student_messages = [
+                msg.get("message", "")
+                for msg in chat_history
+                if msg.get("sender") == sender_key
+            ]
 
-STUDENT: {student_name}
+        inappropriate_from_text = 0
+        for msg in student_messages:
+            is_bad, _ = check_inappropriate_language(msg)
+            if is_bad:
+                inappropriate_from_text += 1
+
+        effective_toxic = max(toxic_count, inappropriate_from_text)
+        total_words = sum(len(m.split()) for m in student_messages)
+        share_hint = ""
+        if message_count > 0 and total_words > 0:
+            share_hint = f"Avg words/message: {total_words / max(message_count, 1):.1f}"
+
+        recent_snippets = [msg[:200] for msg in student_messages[-10:]]
+        messages_block = (
+            "\n".join(f"- {s}" for s in recent_snippets)
+            if recent_snippets
+            else "(No messages sent.)"
+        )
+
+        context = f"""STUDENT DISPLAY NAME: {student_name}
+CHAT USERNAME (for your awareness): {sender_key}
 MESSAGES SENT: {message_count}
-PROGRESS: {story_progress}%
-INAPPROPRIATE LANGUAGE COUNT: {inappropriate_count}
+TOTAL WORDS (their messages): {total_words}
+INAPPROPRIATE-LANGUAGE MESSAGES (count): {effective_toxic}
+OFF-TOPIC SIGNALS (count): {off_topic_count}
+STORY / TASK PROGRESS: {story_progress}%
+BEHAVIOR PROFILE: {behavior_type}
+HINTS / PROMPTS ANSWERED: {hint_responses}
+{share_hint}
 
-STUDENT'S MESSAGES:
-{messages_text}
+THEIR RECENT MESSAGES (newest last, truncated):
+{messages_block}
 
-Write feedback with:
-1. "Hi {student_name}," on its own line
-2. Warm opening acknowledging their contribution
-3. **Strengths:** (2-3 bullet points)
-4. **Areas for Improvement:** (1-2 bullet points, include note about professional language if inappropriate_count > 0)
-5. **Next Steps:** (1-2 bullet points)
-6. Encouraging closing
+TASK / DISCUSSION CONTEXT:
+{story_context or "Desert survival ranking — collaborate and justify item order."}
+"""
 
-Use bullet points with * or -.
+        system_prompt = """You are an expert educational facilitator providing personalized, constructive feedback.
 
-FEEDBACK:"""
-            
-            response = call_llm(
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                system_prompt="You are a warm, supportive teacher giving structured feedback.",
-                temperature=0.7,
-                max_tokens=600
+Generate feedback with:
+1. A warm, personalized opening using the student's display name
+2. **Strengths:** (2-3 bullet points — cite specific ideas or behaviors from their messages when possible)
+3. **Areas for Improvement:** (1-2 bullet points; if inappropriate-language count > 0, mention professional tone respectfully)
+4. **Next Steps:** (1-2 concrete, actionable suggestions)
+5. A brief encouraging closing
+
+Be specific and professional. Return ONLY the feedback text (no preamble or meta-commentary)."""
+
+        if not openai_client and not groq_client:
+            logger.warning("⚠️ No LLM client for feedback; using template fallback")
+            return get_fallback_feedback(
+                student_name, message_count, effective_toxic
             )
-            
-            if response and len(response.strip()) > 50:
-                return f"\n📊 **Your Feedback**\n\n{response.strip()}"
-        
-        # Fallback to template-based feedback
-        return generate_detailed_fallback(student_name, message_count, student_messages, inappropriate_count)
-            
+
+        response = call_llm(
+            messages=[{"role": "user", "content": context}],
+            system_prompt=system_prompt,
+            temperature=0.7,
+            max_tokens=800,
+        )
+
+        if response and len(response.strip()) > 100:
+            return format_feedback_response(response, student_name)
+
+        logger.warning("⚠️ LLM feedback missing or too short; using template fallback")
+        return get_fallback_feedback(student_name, message_count, effective_toxic)
+
     except Exception as e:
         logger.error(f"❌ Error generating feedback: {e}")
-        return generate_detailed_fallback(student_name, message_count, student_messages if 'student_messages' in locals() else [], 0)
+        logger.error(traceback.format_exc())
+        return get_fallback_feedback(
+            student_name,
+            message_count,
+            max(toxic_count, 0),
+        )
 
 def generate_detailed_fallback(student_name: str, message_count: int, student_messages: List[str] = None, inappropriate_count: int = 0) -> str:
     """Fallback feedback when LLM is unavailable"""

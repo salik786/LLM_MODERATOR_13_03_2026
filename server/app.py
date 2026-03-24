@@ -1,6 +1,26 @@
 from __future__ import annotations
-import eventlet
-eventlet.monkey_patch()
+import os
+import sys
+
+# Eventlet monkey-patching breaks on Python 3.12+ (ssl.wrap_socket removed). Default to threading there.
+_socketio_async_mode = os.getenv("SOCKETIO_ASYNC_MODE", "").strip().lower()
+if _socketio_async_mode not in ("eventlet", "threading"):
+    _socketio_async_mode = (
+        "threading" if sys.version_info >= (3, 12) else "eventlet"
+    )
+
+if _socketio_async_mode == "eventlet":
+    import eventlet
+
+    eventlet.monkey_patch()
+
+# Windows consoles often default to cp1252; keep emoji log lines from crashing stderr.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ============================================================
 # LLM Moderator Server with Supabase Integration - RESEARCH VERSION
@@ -8,12 +28,10 @@ eventlet.monkey_patch()
 # Following exact experiment design specifications
 # ============================================================
 
-import os
 import uuid
 import logging
 import time
 import threading
-import sys
 import json
 import csv
 import random
@@ -87,6 +105,8 @@ from prompts import (
     generate_passive_moderator_response,
     generate_personalized_feedback,
     get_random_ending,
+    check_inappropriate_language,
+    get_fallback_feedback,
 )
 
 # ============================================================
@@ -143,7 +163,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet",
+    async_mode=_socketio_async_mode,
     logger=False,
     engineio_logger=False,
     ping_timeout=60,
@@ -1160,16 +1180,9 @@ def get_room_info(room_id: str):
         return jsonify({"error": "Failed to get room info"}), 500
 
 # ============================================================
-# Socket.IO Events
+# Socket.IO Events — room lifecycle & messaging
+# (connect/disconnect registered near socketio initialization)
 # ============================================================
-@socketio.on("connect")
-def handle_connect():
-    logger.info(f"🔌 Client connected: {request.sid}")
-
-@socketio.on("disconnect")
-def handle_disconnect():
-    logger.info(f"🔌 Client disconnected: {request.sid}")
-
 @socketio.on("create_room")
 def create_room_handler(data):
     """Handle room creation"""
@@ -1254,16 +1267,35 @@ def join_room_handler(data):
 
         join_room(room_id)
 
-        # Get chat history
+        # Get chat history (private warnings only go to the targeted user)
         history = get_chat_history(room_id)
-        chat_history = [
-            {
-                "sender": msg['username'],
-                "message": msg['message'],
-                "timestamp": msg['created_at']
+        chat_history = []
+        for msg in history:
+            mtype = msg.get("message_type") or "chat"
+            meta = msg.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            elif meta is None:
+                meta = {}
+            if (
+                msg.get("username") == "Moderator"
+                and mtype == "moderator"
+                and meta.get("trigger") == "inappropriate_language"
+                and meta.get("target_user")
+                and meta.get("target_user") != user_name
+            ):
+                continue
+            entry = {
+                "sender": msg["username"],
+                "message": msg["message"],
+                "timestamp": msg["created_at"],
             }
-            for msg in history
-        ]
+            if meta.get("flagged"):
+                entry["flagged"] = True
+            chat_history.append(entry)
 
         # Get current participants (deduplicated)
         participants = get_participants(room_id)
@@ -1296,7 +1328,7 @@ def join_room_handler(data):
 
 @socketio.on("send_message")
 def send_message_handler(data):
-    """Handle user message"""
+    """Handle user message (with real-time inappropriate-language warnings)."""
     room_id = data.get("room_id")
     sender = data.get("sender")
     msg = (data.get("message") or "").strip()
@@ -1304,15 +1336,62 @@ def send_message_handler(data):
     if not msg:
         return
 
-    # Calculate word count
     word_count = len(msg.split())
-    
     logger.info(f"💬 Message from {sender} in room {room_id}: {msg[:50]}... (words: {word_count})")
 
     try:
         room = get_room(room_id)
-        if not room or room.get('story_finished'):
+        if not room or room.get("story_finished"):
             logger.warning(f"⚠️ Cannot send message - room {room_id} finished or not found")
+            return
+
+        is_inappropriate, bad_words = check_inappropriate_language(msg)
+        if is_inappropriate:
+            logger.warning(f"⚠️ Inappropriate language detected from {sender}: {bad_words}")
+            warning_msg = (
+                "Please keep our discussion professional and respectful. "
+                "Let's focus on the desert survival task."
+            )
+            add_message(
+                room_id=room_id,
+                username="Moderator",
+                message=warning_msg,
+                message_type="moderator",
+                metadata={
+                    "target_user": sender,
+                    "trigger": "inappropriate_language",
+                    "bad_words": bad_words,
+                },
+            )
+            participant_record = get_participant_by_username(room_id, sender)
+            if participant_record and participant_record.get("socket_id"):
+                socketio.emit(
+                    "warning_message",
+                    {"message": warning_msg, "type": "language_warning"},
+                    room=participant_record["socket_id"],
+                )
+            log_moderator_intervention(room_id, "language_warning", sender)
+
+            add_message(
+                room_id=room_id,
+                username=sender,
+                message=msg,
+                message_type="chat",
+                metadata={"word_count": word_count, "flagged": True, "bad_words": bad_words},
+            )
+
+            emit(
+                "receive_message",
+                {
+                    "id": f"{room_id}_{sender}_{int(time.time() * 1000)}",
+                    "sender": sender,
+                    "message": msg,
+                    "timestamp": datetime.now().isoformat(),
+                    "flagged": True,
+                },
+                room=room_id,
+            )
+            logger.info(f"✅ Flagged message stored and warning sent in room {room_id}")
             return
 
         add_message(
@@ -1320,7 +1399,7 @@ def send_message_handler(data):
             username=sender,
             message=msg,
             message_type="chat",
-            metadata={"word_count": word_count}
+            metadata={"word_count": word_count},
         )
 
         emit(
@@ -1355,6 +1434,14 @@ def handle_end_session(data):
         # Get story info
         story_data = get_room_task_data(room_id)
         progress_percent = 100  # For desert survival, always 100% at end
+        task_context = ""
+        if story_data:
+            task_context = (story_data.get("description") or "").strip()
+        if not task_context:
+            task_context = (
+                "Desert survival task: your group discusses and ranks 12 items from "
+                "most to least important for survival, then submits one consensus ranking."
+            )
         
         # ===== 2. GET ALL DATA =====
         participants = get_participants(room_id)
@@ -1479,23 +1566,63 @@ def handle_end_session(data):
             message_count = message_counts.get(username, 0)
             word_count = word_counts.get(username, 0)
             share_of_talk = speaking_shares.get(username, 0)
-            
-            logger.info(f"📝 Generating feedback for {username} ({message_count} messages, {share_of_talk:.1%} share)")
-            
-            # Generate personalized feedback
-            feedback = generate_personalized_feedback(
-                student_name=display_name,
-                message_count=message_count,
-                response_times=[],
-                story_progress=progress_percent,
-                hint_responses=0,
-                behavior_type="moderate",
-                toxic_count=0,
-                off_topic_count=0,
-                chat_history=chat_history_list,
-                story_context=task_context
+
+            inappropriate_count = 0
+            for msg in participant_messages:
+                if msg.get('username') == username:
+                    is_bad, _ = check_inappropriate_language(msg.get('message', ''))
+                    if is_bad:
+                        inappropriate_count += 1
+
+            if message_count == 0:
+                behavior_type = "passive"
+            elif inappropriate_count > 0:
+                behavior_type = "needs_improvement"
+            elif message_count >= 5:
+                behavior_type = "active"
+            else:
+                behavior_type = "moderate"
+
+            logger.info(
+                f"📝 Generating dynamic feedback for {username} "
+                f"(type: {behavior_type}, inappropriate msgs: {inappropriate_count})"
             )
-            
+
+            feedback = None
+            for attempt in range(3):
+                try:
+                    feedback = generate_personalized_feedback(
+                        student_name=display_name,
+                        message_count=message_count,
+                        response_times=[],
+                        story_progress=progress_percent,
+                        hint_responses=0,
+                        behavior_type=behavior_type,
+                        toxic_count=inappropriate_count,
+                        off_topic_count=0,
+                        chat_history=chat_history_list,
+                        story_context=task_context,
+                        chat_sender_name=username,
+                    )
+                    if feedback and len(feedback.strip()) > 100:
+                        logger.info(f"✅ Quality feedback for {username} (attempt {attempt + 1})")
+                        break
+                    logger.warning(f"⚠️ Feedback too short for {username}, retrying...")
+                    time.sleep(1)
+                except Exception as e:
+                    logger.error(f"❌ Feedback attempt {attempt + 1} for {username}: {e}")
+                    if attempt == 2:
+                        feedback = get_fallback_feedback(
+                            display_name, message_count, inappropriate_count
+                        )
+                    else:
+                        time.sleep(1)
+
+            if not feedback or len((feedback or "").strip()) <= 100:
+                feedback = get_fallback_feedback(
+                    display_name, message_count, inappropriate_count
+                )
+
             feedbacks[username] = feedback
             
             # METHOD 1: Direct socket delivery (most reliable)
@@ -1800,16 +1927,26 @@ def stt():
 # ============================================================
 @app.route("/health")
 def health_check():
-    """Health check endpoint"""
+    """Health check with a lightweight Supabase round-trip (skip with ?lite=1 for speed)."""
+    lite = request.args.get("lite", "").lower() in ("1", "true", "yes")
+    supabase_ok = False
+    if not lite:
+        try:
+            supabase.table("rooms").select("id").limit(1).execute()
+            supabase_ok = True
+        except Exception as e:
+            logger.warning(f"/health Supabase check failed: {e}")
     return jsonify({
         "status": "healthy",
         "llm_provider": LLM_PROVIDER,
+        "socketio_async_mode": _socketio_async_mode,
         "openai_available": openai_client is not None,
         "groq_available": groq_client is not None,
+        "supabase_connected": supabase_ok if not lite else None,
         "audio_support": AUDIO_SUPPORT,
         "session_summaries": True,
-        "feedback_delivery": "3-method guaranteed",
-        "timestamp": time.time()
+        "feedback_delivery": "direct-with-broadcast-fallback",
+        "timestamp": time.time(),
     })
 
 # ============================================================
@@ -1819,6 +1956,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logger.info("="*60)
     logger.info("🚀 Starting Flask-SocketIO server")
+    logger.info(f"⚙️ Socket.IO async_mode: {_socketio_async_mode}")
     logger.info(f"📍 Host: 0.0.0.0:{port}")
     logger.info(f"🌐 Frontend: {FRONTEND_URL}")
     logger.info(f"🤖 LLM Provider: {LLM_PROVIDER}")
